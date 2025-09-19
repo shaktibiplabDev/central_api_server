@@ -14,23 +14,52 @@ async function checkUserLicense(licenseKey, options = {}) {
         console.warn(`[DEV MODE] Mocking WHMCS check for user license: ${licenseKey}`);
         return { status: 'active', details: { message: 'Mock validation successful.', mock: true } };
     }
+    
     try {
+        // --- THE FIX: Dynamically resolve IP if domain is provided ---
+        let resolvedIp = options.ip || '';
+        
+        if (options.domain) {
+            try {
+                const { address } = await dns.lookup(options.domain);
+                resolvedIp = address;
+            } catch (dnsError) {
+                console.warn(`Could not resolve IP for ${options.domain}. Error: ${dnsError.message}`);
+                // Continue without the IP, the check might fail at WHMCS but won't crash the server.
+            }
+        }
+
         const timestamp = Math.floor(Date.now() / 1000);
         const randomHash = crypto.createHash('md5').update(Math.random().toString() + licenseKey).digest('hex');
         const check_token = timestamp + randomHash;
-        const postData = new URLSearchParams({ licensekey: licenseKey, domain: options.domain || '', ip: options.ip || '', dir: options.dir || '', check_token: check_token });
+        
+        const postData = new URLSearchParams({
+            licensekey: licenseKey,
+            domain: options.domain || '',
+            ip: resolvedIp, // Use the resolved IP
+            dir: options.dir || '',
+            check_token: check_token
+        });
+        
         const { data: responseBody } = await axios.post(process.env.WHMCS_API_URL, postData, { timeout: 20000 });
+        
         const results = {};
         const matches = [...responseBody.matchAll(/<(.*?)>([^<]+)<\/\1>/g)];
         for (const match of matches) { results[match[1]] = match[2]; }
+        
         if (results.md5hash) {
             const expectedHash = crypto.createHash('md5').update(process.env.WHMCS_SECRET_KEY + check_token).digest('hex');
             if (results.md5hash !== expectedHash) {
                 results.status = 'Invalid';
                 results.description = 'MD5 Checksum Verification Failed.';
             }
-        } else { results.status = 'Invalid'; results.description = 'MD5 Hash was missing.'; }
+        } else {
+            results.status = 'Invalid';
+            results.description = 'MD5 Hash was missing.';
+        }
+        
         return { status: results.status ? results.status.toLowerCase() : 'invalid', details: results };
+        
     } catch (error) {
         return { status: 'inactive', details: { message: 'Failed to contact WHMCS server.', error: error.message } };
     }
@@ -47,6 +76,7 @@ async function checkWebsiteLicense(licenseKey, options = {}) {
         console.error('License Box API URL, Key, or Product ID is not configured in .env');
         return { isValid: false, message: 'Server configuration error.' };
     }
+    
     try {
         let resolvedIp = '127.0.0.1';
         try {
@@ -66,12 +96,11 @@ async function checkWebsiteLicense(licenseKey, options = {}) {
             'LB-LANG': 'english',
             'Content-Type': 'application/json'
         };
+        
         const body = {
             product_id: process.env.LICENSE_BOX_PRODUCT_ID,
             license_code: licenseKey,
-            // --- THIS IS THE FIX ---
-            // Fallback to websiteUrl if clientName is missing or undefined.
-            client_name: options.clientName
+            client_name: options.clientName || options.websiteUrl // Fallback to websiteUrl if clientName is missing
         };
 
         console.log('--- Sending Request to License Box API ---');
@@ -92,6 +121,7 @@ async function checkWebsiteLicense(licenseKey, options = {}) {
         } else {
             return { isValid: false, message: response.data.message || 'Website license is invalid or inactive.' };
         }
+        
     } catch (error) {
         const errorMessage = error.response ? JSON.stringify(error.response.data) : 'Failed to contact the website license server.';
         console.error('--- License Box API Error ---');
