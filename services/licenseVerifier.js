@@ -46,8 +46,12 @@ const verifier = {
                         const result = await licenseService.checkUserLicense(user.license_key, { domain: hostname, ip: resolvedIp });
                         let newRemoteStatus = result.status.toLowerCase();
 
+                        // Map WHMCS statuses to our database statuses
                         if (newRemoteStatus === 'reissued') {
                             newRemoteStatus = 'active';
+                        }
+                        if (newRemoteStatus === 'invalid') {
+                            newRemoteStatus = 'suspended';
                         }
 
                         if (newRemoteStatus !== user.license_status) {
@@ -102,4 +106,3 @@ const verifier = {
 };
 
 module.exports = verifier;
-
