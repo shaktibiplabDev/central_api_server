@@ -580,4 +580,27 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
     }
 });
 
+// --- THIS IS THE NEW HISTORY ENDPOINT ---
+router.get('/forms/history', authenticateToken, async (req, res) => {
+    try {
+        const user = req.user;
+
+        // Securely fetches data directly from our own central database
+        const [history] = await pool.query(
+            `SELECT form_type, application_id, status, submitted_at 
+             FROM submission_logs 
+             WHERE user_id = ? 
+             ORDER BY submitted_at DESC 
+             LIMIT 50`,
+            [user.id]
+        );
+
+        res.json(history);
+
+    } catch (error) {
+        console.error(`Error fetching form history for user ${req.user.id}:`, error.message);
+        res.status(500).json({ error: 'Internal server error while fetching form history.' });
+    }
+});
+
 module.exports = router;

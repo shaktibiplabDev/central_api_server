@@ -17,7 +17,7 @@ module.exports = {
 
         for (const field of requiredFields) {
             if (!data[field] || String(data[field]).trim() === '') {
-                return `Field '${field}' is required and cannot be empty.`;
+                return `Field '${field.replace('_base64', '')}' is required and cannot be empty.`;
             }
         }
 
@@ -41,15 +41,15 @@ module.exports = {
     },
 
     process: async (data, user) => {
-        // Get user's approved website details
-        const [websites] = await pool.query("SELECT url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        // Step 1: Get user's approved website details
+        const [websites] = await pool.query("SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
         if (websites.length === 0 || websites[0].status !== 'approved') {
             throw new Error('User does not have an approved website for submissions.');
         }
         const website = websites[0];
         const headers = { 'X-Website-License': website.website_license_key };
 
-        // Pre-submission check for price and balance
+        // Step 2: Pre-submission check for price and balance
         let servicePrice;
         let userBalance;
         try {
@@ -68,7 +68,7 @@ module.exports = {
             throw new Error('Could not verify price and balance with the client website.');
         }
 
-        // Check for sufficient funds
+        // Step 3: Check for sufficient funds
         if (userBalance < servicePrice) {
             const error = new Error(`Insufficient wallet balance. Required: ${servicePrice}, Available: ${userBalance}`);
             error.statusCode = 402;
@@ -104,20 +104,39 @@ module.exports = {
             }
         };
 
-        // Submit to client website
+        // Step 4: Submit to client website
+        let finalResponseData;
         try {
             const submitUrl = `${website.url}/api/forms/address-update`;
-            const finalResponse = await axios.post(submitUrl, processedData, { 
+            const response = await axios.post(submitUrl, processedData, { 
                 headers, 
                 timeout: 45000 
             });
-
-            return finalResponse.data;
+            finalResponseData = response.data;
         } catch (error) {
             const errorMessage = error.response ? 
                 (error.response.data.error || JSON.stringify(error.response.data)) : 
                 'Failed to submit form to the client website.';
             throw new Error(errorMessage);
         }
+
+        // --- NEW LOGGING FEATURE ---
+        // After the client website confirms a successful submission, we save a record.
+        if (finalResponseData && finalResponseData.applicationId) {
+            try {
+                await pool.query(
+                    'INSERT INTO submission_logs (user_id, website_id, form_type, application_id) VALUES (?, ?, ?, ?)',
+                    [user.id, website.id, 'addressUpdate', finalResponseData.applicationId]
+                );
+                console.log(`[Logger] Successfully logged submission ${finalResponseData.applicationId} for user ${user.id}`);
+            } catch (logError) {
+                // If logging fails, we don't want to fail the whole request for the user.
+                // We just log this critical error to the console for you to review later.
+                console.error('CRITICAL: Failed to log a successful submission!', logError);
+            }
+        }
+        
+        return finalResponseData; // Return the original success response to the app
     }
 };
+

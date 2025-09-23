@@ -52,6 +52,19 @@ const DB_SCHEMA = {
                 expires_at TIMESTAMP NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             `
+        },
+        submission_logs: {
+            columns: `
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                website_id INT NOT NULL,
+                form_type VARCHAR(50) NOT NULL,
+                application_id VARCHAR(100) NOT NULL,
+                status VARCHAR(50) DEFAULT 'submitted',
+                submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (website_id) REFERENCES websites(id) ON DELETE CASCADE
+            `
         }
     }
 };
