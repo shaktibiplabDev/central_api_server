@@ -1,5 +1,5 @@
 const DB_SCHEMA = {
-    creationOrder: ['websites', 'users', 'app_settings', 'app_uploads'],
+    creationOrder: ['websites', 'users', 'app_settings', 'app_uploads', 'submission_logs'],
     tables: {
         websites: {
             columns: `
