@@ -1,9 +1,6 @@
 const { pool } = require('../config/database');
 const axios = require('axios');
 
-/**
- * A collection of validation helper functions.
- */
 const validators = {
     isValidAadhar: (aadhar) => /^[0-9]{12}$/.test(aadhar),
     isValidMobile: (mobile) => /^[0-9]{10}$/.test(mobile),
@@ -11,14 +8,11 @@ const validators = {
 };
 
 module.exports = {
-    /**
-     * Performs robust validation on the incoming address update data.
-     */
     validate: async (data, user) => {
         const requiredFields = [
             'full_name', 'aadhaar_no', 'village', 'district',
             'mobile_no', 'post', 'state', 'pincode', 'purpose',
-            'document_base64' // Assuming the document is sent as a Base64 string
+            'document_base64'
         ];
 
         for (const field of requiredFields) {
@@ -43,14 +37,11 @@ module.exports = {
             return 'A total of at least 6 fingerprints must be captured or marked as missing.';
         }
         
-        return null; // All validation passed
+        return null;
     },
 
-    /**
-     * Orchestrates the secure submission of the address update form.
-     */
     process: async (data, user) => {
-        // Step 1: Get user's approved website details
+        // Get user's approved website details
         const [websites] = await pool.query("SELECT url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
         if (websites.length === 0 || websites[0].status !== 'approved') {
             throw new Error('User does not have an approved website for submissions.');
@@ -58,7 +49,7 @@ module.exports = {
         const website = websites[0];
         const headers = { 'X-Website-License': website.website_license_key };
 
-        // Step 2: Pre-submission check for price and balance
+        // Pre-submission check for price and balance
         let servicePrice;
         let userBalance;
         try {
@@ -77,24 +68,55 @@ module.exports = {
             throw new Error('Could not verify price and balance with the client website.');
         }
 
-        // Step 3: Check for sufficient funds
+        // Check for sufficient funds
         if (userBalance < servicePrice) {
             const error = new Error(`Insufficient wallet balance. Required: ${servicePrice}, Available: ${userBalance}`);
-            error.statusCode = 402; // Payment Required
+            error.statusCode = 402;
             throw error;
         }
 
-        // Step 4: Submit the full form data for final processing
+        // Process fingerprints for PHP compatibility
+        const processedData = {
+            email: user.email,
+            formData: {
+                // Map fields according to PHP form expectations
+                full_name: data.full_name,
+                aadhaar_no: data.aadhaar_no,
+                village: data.village,
+                district: data.district,
+                mobile_no: data.mobile_no,
+                post: data.post,
+                state: data.state,
+                pincode: data.pincode,
+                purpose: data.purpose,
+                landmark: data.landmark || '',
+                document_base64: data.document_base64,
+                // Process fingerprints for PHP format
+                fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
+                    if (fp && fp.id && fp.data) {
+                        // Remove base64 prefix for PHP compatibility
+                        const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
+                        acc[fp.id] = cleanData;
+                    }
+                    return acc;
+                }, {}) : {},
+                missing_fingers: data.missing_fingers ? data.missing_fingers.join(',') : ''
+            }
+        };
+
+        // Submit to client website
         try {
             const submitUrl = `${website.url}/api/forms/address-update`;
-            const finalResponse = await axios.post(submitUrl, {
-                email: user.email,
-                formData: data
-            }, { headers, timeout: 45000 });
+            const finalResponse = await axios.post(submitUrl, processedData, { 
+                headers, 
+                timeout: 45000 
+            });
 
             return finalResponse.data;
         } catch (error) {
-            const errorMessage = error.response ? (error.response.data.error || JSON.stringify(error.response.data)) : 'Failed to submit form to the client website.';
+            const errorMessage = error.response ? 
+                (error.response.data.error || JSON.stringify(error.response.data)) : 
+                'Failed to submit form to the client website.';
             throw new Error(errorMessage);
         }
     }

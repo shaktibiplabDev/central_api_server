@@ -26,9 +26,133 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 // --- End of Multer Config ---
 
-// --- Public Endpoint ---
+// --- Field Mapping Configuration ---
+const fieldMappings = {
+    'child-enrollment': {
+        fields: {
+            'child_name': 'child_name',
+            'child_dob': 'child_dob',
+            'child_gender': 'child_gender',
+            'child_birthplace': 'child_birthplace',
+            'guardian_name': 'guardian_name',
+            'guardian_relation': 'guardian_relation',
+            'guardian_aadhar': 'guardian_aadhar',
+            'guardian_mobile': 'guardian_mobile',
+            'address_line1': 'address_line1',
+            'city': 'city',
+            'district': 'district',
+            'state': 'state',
+            'pincode': 'pincode',
+            'purpose': 'purpose'
+        },
+        files: {
+            'birth_certificate_base64': 'birth_certificate',
+            'guardian_id_proof_base64': 'guardian_id_proof_file',
+            'child_photo_base64': 'child_photo'
+        }
+    },
+    'address-update': {
+        fields: {
+            'full_name': 'full_name',
+            'aadhaar_no': 'aadhaar_no',
+            'village': 'village',
+            'district': 'district',
+            'mobile_no': 'mobile_no',
+            'post': 'post',
+            'state': 'state',
+            'pincode': 'pincode',
+            'purpose': 'purpose',
+            'landmark': 'landmark'
+        },
+        files: {
+            'document_base64': 'document'
+        }
+    },
+    'dob-update': {
+        fields: {
+            'full_name': 'full_name',
+            'aadhaar_no': 'aadhaar_no',
+            'village': 'village',
+            'district': 'district',
+            'mobile_no': 'mobile_no',
+            'old_dob': 'old_dob',
+            'post': 'post',
+            'state': 'state',
+            'new_dob': 'new_dob',
+            'father_name': 'father_name',
+            'pincode': 'pincode',
+            'purpose': 'purpose',
+            'landmark': 'landmark'
+        },
+        files: {
+            'photo_base64': 'photo',
+            'documents_base64': 'documents'
+        }
+    },
+    'mobile-email-update': {
+        fields: {
+            'full_name': 'full_name',
+            'mobile_no': 'mobile_no',
+            'email_id': 'email_id',
+            'purpose': 'purpose',
+            'aadhar_no': 'aadhar_no',
+            'father_name': 'father_name'
+        },
+        files: {} // No file uploads for this form
+    },
+    'name-update': {
+        fields: {
+            'old_name': 'old_name',
+            'new_name': 'new_name',
+            'father_name': 'father_name',
+            'dob': 'dob',
+            'aadhaar_no': 'aadhaar_no',
+            'purpose': 'purpose',
+            'pincode': 'pincode',
+            'village_town': 'village_town',
+            'district': 'district',
+            'landmark': 'landmark'
+        },
+        files: {
+            'candidate_photo_base64': 'candidate_photo',
+            'supporting_document_base64': 'supporting_document'
+        }
+    }
+};
 
-// Serves the latest app info
+// --- Enhanced Validators ---
+const enhancedValidators = {
+    isValidAadhar: (aadhar) => /^[0-9]{12}$/.test(aadhar),
+    isValidMobile: (mobile) => /^[0-9]{10}$/.test(mobile),
+    isValidPincode: (pincode) => /^[0-9]{6}$/.test(pincode),
+    isValidEmail: (email) => /^\S+@\S+\.\S+$/.test(email),
+    isFutureDate: (dateString) => new Date(dateString) > new Date(),
+    areDatesSame: (date1, date2) => new Date(date1).toDateString() === new Date(date2).toDateString(),
+    
+    // File validation
+    isValidBase64: (base64String) => {
+        if (!base64String) return false;
+        try {
+            if (base64String.includes(';base64,')) {
+                const parts = base64String.split(';base64,');
+                if (parts.length !== 2) return false;
+                return Buffer.from(parts[1], 'base64').length > 0;
+            }
+            return Buffer.from(base64String, 'base64').length > 0;
+        } catch {
+            return false;
+        }
+    },
+    
+    // Biometric validation
+    validateFingerprints: (fingerprints, missingFingers) => {
+        const capturedFingers = fingerprints ? fingerprints.filter(f => f && f.data).length : 0;
+        const missingFingersCount = missingFingers ? missingFingers.length : 0;
+        return (capturedFingers + missingFingersCount) >= 6;
+    }
+};
+
+// --- Public Endpoint ---
 router.get('/app-info', (req, res) => {
     try {
         const appInfo = {
@@ -52,6 +176,169 @@ function authenticateToken(req, res, next) {
         req.user = user;
         next();
     });
+}
+
+// --- Enhanced Form Data Processor ---
+function processFormData(formData, formType) {
+    const mapping = fieldMappings[formType];
+    if (!mapping) {
+        throw new Error(`No field mapping found for form type: ${formType}`);
+    }
+
+    const processedData = {
+        fields: {},
+        files: {}
+    };
+
+    // Process regular fields
+    for (const [centralField, phpField] of Object.entries(mapping.fields)) {
+        if (formData[centralField] !== undefined) {
+            processedData.fields[phpField] = formData[centralField];
+        }
+    }
+
+    // Process file fields
+    for (const [centralField, phpField] of Object.entries(mapping.files)) {
+        if (formData[centralField]) {
+            processedData.files[phpField] = formData[centralField];
+        }
+    }
+
+    // Process fingerprints - convert to PHP format
+    if (formData.fingerprints && Array.isArray(formData.fingerprints)) {
+        const phpFingerprints = {};
+        formData.fingerprints.forEach(fp => {
+            if (fp && fp.id && fp.data) {
+                phpFingerprints[fp.id] = fp.data; // Remove base64 prefix for PHP compatibility
+            }
+        });
+        processedData.fields.fingerprint = phpFingerprints;
+    }
+
+    // Process missing fingers
+    if (formData.missing_fingers && Array.isArray(formData.missing_fingers)) {
+        processedData.fields.missing_fingers = formData.missing_fingers.join(',');
+    }
+
+    return processedData;
+}
+
+// --- Enhanced Validation Function ---
+function validateFormData(formData, formType) {
+    const errors = [];
+
+    // Required field validation based on form type
+    const mapping = fieldMappings[formType];
+    if (!mapping) {
+        return [`Invalid form type: ${formType}`];
+    }
+
+    // Check required fields
+    for (const [centralField, phpField] of Object.entries(mapping.fields)) {
+        if (!formData[centralField] || String(formData[centralField]).trim() === '') {
+            errors.push(`Field '${phpField}' is required.`);
+        }
+    }
+
+    // Check required files
+    for (const [centralField, phpField] of Object.entries(mapping.files)) {
+        if (!formData[centralField]) {
+            errors.push(`File '${phpField}' is required.`);
+        }
+    }
+
+    // Form-specific validation
+    switch (formType) {
+        case 'child-enrollment':
+            if (formData.child_dob && enhancedValidators.isFutureDate(formData.child_dob)) {
+                errors.push('Child date of birth cannot be in the future.');
+            }
+            if (formData.guardian_aadhar && !enhancedValidators.isValidAadhar(formData.guardian_aadhar)) {
+                errors.push('Guardian Aadhar must be a valid 12-digit number.');
+            }
+            if (formData.guardian_mobile && !enhancedValidators.isValidMobile(formData.guardian_mobile)) {
+                errors.push('Guardian mobile must be a valid 10-digit number.');
+            }
+            if (formData.pincode && !enhancedValidators.isValidPincode(formData.pincode)) {
+                errors.push('Pincode must be a valid 6-digit number.');
+            }
+            break;
+
+        case 'address-update':
+            if (formData.aadhaar_no && !enhancedValidators.isValidAadhar(formData.aadhaar_no)) {
+                errors.push('Aadhaar number must be a valid 12-digit number.');
+            }
+            if (formData.mobile_no && !enhancedValidators.isValidMobile(formData.mobile_no)) {
+                errors.push('Mobile number must be a valid 10-digit number.');
+            }
+            if (formData.pincode && !enhancedValidators.isValidPincode(formData.pincode)) {
+                errors.push('Pincode must be a valid 6-digit number.');
+            }
+            break;
+
+        case 'dob-update':
+            if (formData.aadhaar_no && !enhancedValidators.isValidAadhar(formData.aadhaar_no)) {
+                errors.push('Aadhaar number must be a valid 12-digit number.');
+            }
+            if (formData.mobile_no && !enhancedValidators.isValidMobile(formData.mobile_no)) {
+                errors.push('Mobile number must be a valid 10-digit number.');
+            }
+            if (formData.pincode && !enhancedValidators.isValidPincode(formData.pincode)) {
+                errors.push('Pincode must be a valid 6-digit number.');
+            }
+            if (formData.old_dob && enhancedValidators.isFutureDate(formData.old_dob)) {
+                errors.push('Old date of birth cannot be in the future.');
+            }
+            if (formData.new_dob && enhancedValidators.isFutureDate(formData.new_dob)) {
+                errors.push('New date of birth cannot be in the future.');
+            }
+            if (formData.old_dob && formData.new_dob && enhancedValidators.areDatesSame(formData.old_dob, formData.new_dob)) {
+                errors.push('New DOB must be different from the old DOB.');
+            }
+            break;
+
+        case 'mobile-email-update':
+            if (formData.email_id && !enhancedValidators.isValidEmail(formData.email_id)) {
+                errors.push('Invalid email format provided.');
+            }
+            if (formData.mobile_no && !enhancedValidators.isValidMobile(formData.mobile_no)) {
+                errors.push('Mobile number must be a valid 10-digit number.');
+            }
+            if (formData.aadhar_no && !enhancedValidators.isValidAadhar(formData.aadhar_no)) {
+                errors.push('Aadhar number must be a valid 12-digit number.');
+            }
+            break;
+
+        case 'name-update':
+            if (formData.aadhaar_no && !enhancedValidators.isValidAadhar(formData.aadhaar_no)) {
+                errors.push('Aadhaar number must be a valid 12-digit number.');
+            }
+            if (formData.pincode && !enhancedValidators.isValidPincode(formData.pincode)) {
+                errors.push('Pincode must be a valid 6-digit number.');
+            }
+            if (formData.dob && enhancedValidators.isFutureDate(formData.dob)) {
+                errors.push('Date of birth cannot be in the future.');
+            }
+            if (formData.old_name && formData.new_name && 
+                formData.old_name.trim().toLowerCase() === formData.new_name.trim().toLowerCase()) {
+                errors.push('New name must be different from the old name.');
+            }
+            break;
+    }
+
+    // Biometric validation
+    if (!enhancedValidators.validateFingerprints(formData.fingerprints, formData.missing_fingers)) {
+        errors.push('A total of at least 6 fingerprints must be captured or marked as missing.');
+    }
+
+    // File validation
+    for (const [centralField, phpField] of Object.entries(mapping.files)) {
+        if (formData[centralField] && !enhancedValidators.isValidBase64(formData[centralField])) {
+            errors.push(`Invalid file format for ${phpField}.`);
+        }
+    }
+
+    return errors.length > 0 ? errors : null;
 }
 
 // --- Authentication Routes ---
@@ -141,7 +428,6 @@ router.post('/login', async (req, res) => {
 router.post('/app-upload', upload.single('apkfile'), async (req, res) => {
     try {
         const { token } = req.query;
-        // The password now comes from the header for API-based uploads
         const password = req.header('X-Upload-Password');
 
         if (!token || !password || !req.file) {
@@ -214,47 +500,83 @@ router.get('/user/wallet', authenticateToken, async (req, res) => {
     }
 });
 
+// --- ENHANCED FORM SUBMISSION ENDPOINT ---
 router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res) => {
     try {
         const { formType } = req.params;
         
-        if (!/^[a-zA-Z0-9_]+$/.test(formType)) {
+        if (!/^[a-zA-Z0-9-]+$/.test(formType)) {
             return res.status(400).json({ error: 'Invalid form type specified.' });
+        }
+
+        // Check if form type is supported
+        if (!fieldMappings[formType]) {
+            return res.status(404).json({ error: `Form type '${formType}' not supported.` });
         }
 
         const handlerPath = path.join(__dirname, '..', 'forms', `${formType}.js`);
         if (!fs.existsSync(handlerPath)) {
-            return res.status(404).json({ error: `Form type '${formType}' not found.` });
+            return res.status(404).json({ error: `Form handler for '${formType}' not found.` });
         }
 
-        // --- NEW FILE-TO-BASE64 CONVERSION LOGIC ---
-        const formData = { ...req.body }; // Copy text fields
+        // Process incoming data
+        const formData = { ...req.body };
+        
+        // Handle file conversions - convert to Base64 strings
         if (req.files && req.files.length > 0) {
             for (const file of req.files) {
-                // Convert the file's raw buffer into a Base64 string with the correct MIME type prefix
                 const base64String = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
-                // Add the Base64 string to our form data object.
                 formData[`${file.fieldname}_base64`] = base64String;
             }
         }
-        // --- END OF NEW LOGIC ---
 
         const formHandler = require(handlerPath);
         
-        const validationError = await formHandler.validate(formData, req.user);
-        if (validationError) {
-             return res.status(400).json({ error: 'Validation failed', details: validationError });
+        // Enhanced validation
+        const validationErrors = validateFormData(formData, formType);
+        if (validationErrors) {
+            return res.status(400).json({ 
+                error: 'Validation failed', 
+                details: validationErrors,
+                fieldMappings: fieldMappings[formType]
+            });
         }
 
+        // Process the form with enhanced data
         const result = await formHandler.process(formData, req.user);
-        res.json({ message: 'Form processed successfully.', data: result });
+        
+        res.json({ 
+            message: 'Form processed successfully.', 
+            data: result,
+            timestamp: new Date().toISOString()
+        });
 
     } catch (error) {
         console.error(`Form submission error for ${req.params.formType}:`, error);
+        
+        // Enhanced error handling with specific messages
         if (error.statusCode === 402) {
-            return res.status(402).json({ error: 'Payment Required', details: error.message });
+            return res.status(402).json({ 
+                error: 'Payment Required', 
+                details: error.message,
+                code: 'INSUFFICIENT_FUNDS'
+            });
         }
-        res.status(500).json({ error: 'An error occurred while processing the form.' });
+        
+        if (error.response) {
+            // Pass through client website errors
+            return res.status(error.response.status || 500).json({
+                error: 'Client website error',
+                details: error.response.data,
+                code: 'CLIENT_WEBSITE_ERROR'
+            });
+        }
+        
+        res.status(500).json({ 
+            error: 'An error occurred while processing the form.',
+            details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+            code: 'INTERNAL_ERROR'
+        });
     }
 });
 
