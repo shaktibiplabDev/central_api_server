@@ -12,41 +12,38 @@ const licenseVerifier = require('./services/licenseVerifier');
 const apiRoutes = require('./routes/api');
 const { pool } = require('./config/database');
 
+// Main async function to control startup order
 const startServer = async () => {
     console.log('--- Starting Application Server ---');
 
-    // Step 1: Critical sequential startup
     await synchronizeDb();
     await settingsService.load();
 
-    // Step 2: Prepare express
     const app = express();
     app.use(helmet());
     app.use(cors());
     app.use(express.json());
-
-    // Static + routes
+    
+    // Serve static files from the public directory FIRST
     app.use(express.static(path.join(__dirname, 'public')));
+    
+    // Then add your API routes
     app.use('/api', apiRoutes);
+
+    // Make the 'downloads' folder publicly accessible with specific route
     app.use('/downloads', express.static(path.join(__dirname, 'public/downloads')));
 
-    // Step 3: Run independent tasks in parallel
-    const preferredPort = parseInt(process.env.PORT, 10) || 3000;
+    try {
+        const preferredPort = parseInt(process.env.PORT, 10) || 3000;
+        const actualPort = await findPortAndListen(app, preferredPort);
+        console.log(`✅ Express server is running on port ${actualPort}`);
+    } catch (error) {
+        console.error('❌ Could not start Express server:', error);
+        process.exit(1);
+    }
 
-    await Promise.allSettled([
-        (async () => {
-            const actualPort = await findPortAndListen(app, preferredPort);
-            console.log(`✅ Express server is running on port ${actualPort}`);
-        })(),
-        (async () => {
-            await client.login(process.env.DISCORD_BOT_TOKEN);
-            console.log('✅ Discord bot logged in');
-        })(),
-        (async () => {
-            licenseVerifier.start();
-            console.log('✅ License verifier started');
-        })()
-    ]);
+    await client.login(process.env.DISCORD_BOT_TOKEN);
+    licenseVerifier.start();
 
     console.log('--- ✅ Application is fully operational. ---');
 };
