@@ -603,4 +603,49 @@ router.get('/forms/history', authenticateToken, async (req, res) => {
     }
 });
 
+// --- NEW ENDPOINT: Get a website's full price list for display in the app ---
+router.get('/services/pricelist', authenticateToken, async (req, res) => {
+    try {
+        const user = req.user; // User object from JWT
+
+        // 1. Get the user's website details from our database
+        const [websites] = await pool.query(
+            "SELECT url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)",
+            [user.id]
+        );
+
+        if (websites.length === 0) {
+            return res.status(404).json({ error: "Associated website not found for this user." });
+        }
+        
+        const website = websites[0];
+
+        // 2. Check if the website is approved
+        if (website.status !== 'approved') {
+            return res.status(403).json({ error: `Cannot fetch data: Website is currently ${website.status}.` });
+        }
+
+        // 3. Proxy the request to the client website to get their full price list
+        const clientApiUrl = `${website.url}/api/prices/full-list`;
+
+        const response = await axios.get(clientApiUrl, {
+            headers: {
+                // The secret key proves this request is from our trusted server
+                'X-Website-License': website.website_license_key
+            },
+            timeout: 15000
+        });
+
+        // 4. Relay the price list back to the mobile app
+        res.json(response.data);
+
+    } catch (error) {
+        console.error(`Error fetching price list for user ${req.user.id}:`, error.message);
+        if (error.response) {
+            return res.status(error.response.status).json({ error: 'An error occurred on the client website.', details: error.response.data });
+        }
+        res.status(500).json({ error: 'Internal server error while fetching price list.' });
+    }
+});
+
 module.exports = router;
