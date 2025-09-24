@@ -1,5 +1,5 @@
 const DB_SCHEMA = {
-    creationOrder: ['websites', 'users', 'app_settings', 'app_uploads', 'submission_logs', 'website_prices'],
+    creationOrder: ['websites', 'users', 'app_settings', 'app_uploads', 'submission_logs'],
     tables: {
         websites: {
             columns: `
@@ -66,17 +66,6 @@ const DB_SCHEMA = {
                 FOREIGN KEY (website_id) REFERENCES websites(id) ON DELETE CASCADE
             `
         },
-        website_prices: {
-            columns: `
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                website_id INT NOT NULL,
-                service_key VARCHAR(50) NOT NULL,
-                price DECIMAL(10, 2) NOT NULL,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY (website_id, service_key),
-                FOREIGN KEY (website_id) REFERENCES websites(id) ON DELETE CASCADE
-            `
-        }
     }
 };
 
