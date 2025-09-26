@@ -54,7 +54,7 @@ const fieldMappings = {
     'address-update': {
         fields: {
             'full_name': 'full_name',
-            'aadhaar_no': 'aadhaar_no',
+            'aadhaar_no': 'aadhaar_no', 
             'village': 'village',
             'district': 'district',
             'mobile_no': 'mobile_no',
@@ -65,7 +65,7 @@ const fieldMappings = {
             'landmark': 'landmark'
         },
         files: {
-            'document_base64': 'document'
+            'document_base64': 'document'  // This should match what PHP expects
         }
     },
     'dob-update': {
@@ -122,13 +122,25 @@ const fieldMappings = {
 
 // --- Enhanced Validators ---
 const enhancedValidators = {
-    isValidAadhar: (aadhar) => /^[0-9]{12}$/.test(aadhar),
-    isValidMobile: (mobile) => /^[0-9]{10}$/.test(mobile),
-    isValidPincode: (pincode) => /^[0-9]{6}$/.test(pincode),
+    isValidAadhar: (aadhar) => {
+        if (!aadhar) return false;
+        const cleanAadhar = aadhar.toString().replace(/\D/g, ''); // Remove non-digits
+        return /^[0-9]{12}$/.test(cleanAadhar);
+    },
+    isValidMobile: (mobile) => {
+        if (!mobile) return false;
+        const cleanMobile = mobile.toString().replace(/\D/g, ''); // Remove non-digits
+        return /^[0-9]{10}$/.test(cleanMobile);
+    },
+    isValidPincode: (pincode) => {
+        if (!pincode) return false;
+        const cleanPincode = pincode.toString().replace(/\D/g, ''); // Remove non-digits
+        return /^[0-9]{6}$/.test(cleanPincode);
+    },
     isValidEmail: (email) => /^\S+@\S+\.\S+$/.test(email),
     isFutureDate: (dateString) => new Date(dateString) > new Date(),
     areDatesSame: (date1, date2) => new Date(date1).toDateString() === new Date(date2).toDateString(),
-    
+
     // File validation
     isValidBase64: (base64String) => {
         if (!base64String) return false;
@@ -143,15 +155,31 @@ const enhancedValidators = {
             return false;
         }
     },
-    
+
     // Biometric validation
     validateFingerprints: (fingerprints, missingFingers) => {
-        const capturedFingers = fingerprints ? fingerprints.filter(f => f && f.data).length : 0;
-        const missingFingersCount = missingFingers ? missingFingers.length : 0;
+        let fingerprintArray = [];
+
+        // Handle array
+        if (Array.isArray(fingerprints)) {
+            fingerprintArray = fingerprints;
+        }
+        // Handle JSON string
+        else if (typeof fingerprints === 'string') {
+            try {
+                fingerprintArray = JSON.parse(fingerprints);
+            } catch (e) {
+                console.error('Invalid fingerprints JSON:', e);
+                return false;
+            }
+        }
+
+        const capturedFingers = fingerprintArray.filter(f => f && f.data).length;
+        const missingFingersCount = Array.isArray(missingFingers) ? missingFingers.length : 0;
+
         return (capturedFingers + missingFingersCount) >= 6;
     }
 };
-
 // --- Public Endpoint ---
 router.get('/app-info', (req, res) => {
     try {
@@ -319,7 +347,7 @@ function validateFormData(formData, formType) {
             if (formData.dob && enhancedValidators.isFutureDate(formData.dob)) {
                 errors.push('Date of birth cannot be in the future.');
             }
-            if (formData.old_name && formData.new_name && 
+            if (formData.old_name && formData.new_name &&
                 formData.old_name.trim().toLowerCase() === formData.new_name.trim().toLowerCase()) {
                 errors.push('New name must be different from the old name.');
             }
@@ -350,7 +378,7 @@ router.post('/register', async (req, res) => {
         const hostname = new url.URL(websiteUrl).hostname;
         const userLicenseResult = await checkUserLicense(userLicenseKey, { domain: hostname });
         if (userLicenseResult.status !== 'active') return res.status(400).json({ error: 'Your personal user license is not active.' });
-        
+
         let websiteLicenseKey, clientName;
         try {
             const licenseResponse = await axios.get(`${websiteUrl}/api/verify-license`, { timeout: 10000 });
@@ -362,7 +390,7 @@ router.post('/register', async (req, res) => {
             if (error.config && error.config.url.includes('verify-credentials')) return res.status(401).json({ error: 'Invalid credentials for the specified website.' });
             return res.status(400).json({ error: 'Could not verify the provided website URL.' });
         }
-        
+
         const licenseBoxResult = await checkWebsiteLicense(websiteLicenseKey, { websiteUrl, clientName });
         const nameserverResult = await checkNameservers(websiteUrl);
 
@@ -375,7 +403,7 @@ router.post('/register', async (req, res) => {
             if (!licenseBoxResult.isValid) approvalMessage += `\n- License Box: ${licenseBoxResult.message}`;
             if (!nameserverResult.isVerified) approvalMessage += `\n- Nameserver: ${nameserverResult.message}`;
         }
-        
+
         let [websites] = await pool.query('SELECT id FROM websites WHERE url = ?', [websiteUrl]);
         let websiteId;
         if (websites.length > 0) {
@@ -453,7 +481,7 @@ router.post('/app-upload', upload.single('apkfile'), async (req, res) => {
         const newFileName = `app-v${uploadSession.version}.apk`;
         const newFilePath = path.join(uploadDir, newFileName);
         fs.renameSync(req.file.path, newFilePath);
-        
+
         const serverBaseUrl = process.env.SERVER_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
         const publicDownloadUrl = `${serverBaseUrl}/downloads/${newFileName}`;
 
@@ -504,7 +532,7 @@ router.get('/user/wallet', authenticateToken, async (req, res) => {
 router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res) => {
     try {
         const { formType } = req.params;
-        
+
         if (!/^[a-zA-Z0-9-]+$/.test(formType)) {
             return res.status(400).json({ error: 'Invalid form type specified.' });
         }
@@ -514,29 +542,71 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
             return res.status(404).json({ error: `Form type '${formType}' not supported.` });
         }
 
-        const handlerPath = path.join(__dirname, '..', 'forms', `${formType}.js`);
+        const fileName = formType.replace(/-([a-z])/g, (g) => g[1].toUpperCase());
+        const handlerPath = path.join(__dirname, '..', 'forms', `${fileName}.js`);
+
         if (!fs.existsSync(handlerPath)) {
-            return res.status(404).json({ error: `Form handler for '${formType}' not found.` });
+            return res.status(404).json({ error: `Form handler for '${formType}' not found. Looking for: ${fileName}.js` });
         }
 
         // Process incoming data
         const formData = { ...req.body };
-        
-        // Handle file conversions - convert to Base64 strings
+
+        // Handle file conversions - files are saved to disk by multer
         if (req.files && req.files.length > 0) {
             for (const file of req.files) {
-                const base64String = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
-                formData[`${file.fieldname}_base64`] = base64String;
+                try {
+                    // Files are saved to disk, so read them from the file path
+                    const fileData = fs.readFileSync(file.path);
+                    const base64String = `data:${file.mimetype};base64,${fileData.toString('base64')}`;
+                    formData[`${file.fieldname}_base64`] = base64String;
+
+                    // Clean up the temporary file after reading
+                    fs.unlinkSync(file.path);
+                } catch (fileError) {
+                    console.error('Error processing file:', file.fieldname, fileError);
+                    // Continue with other files even if one fails
+                }
+            }
+        }
+
+        // Parse JSON strings for fingerprints and missing_fingers
+        if (formData.fingerprints && typeof formData.fingerprints === 'string') {
+            try {
+                formData.fingerprints = JSON.parse(formData.fingerprints);
+            } catch (e) {
+                console.error('Invalid fingerprints JSON:', e);
+                formData.fingerprints = [];
+            }
+        }
+
+        if (formData.missing_fingers && typeof formData.missing_fingers === 'string') {
+            try {
+                formData.missing_fingers = JSON.parse(formData.missing_fingers);
+            } catch (e) {
+                console.error('Invalid missing_fingers JSON:', e);
+                formData.missing_fingers = [];
             }
         }
 
         const formHandler = require(handlerPath);
-        
+
+        // Clean number fields by removing any non-digit characters
+        if (formData.guardian_aadhar) {
+            formData.guardian_aadhar = formData.guardian_aadhar.toString().replace(/\D/g, '');
+        }
+        if (formData.guardian_mobile) {
+            formData.guardian_mobile = formData.guardian_mobile.toString().replace(/\D/g, '');
+        }
+        if (formData.pincode) {
+            formData.pincode = formData.pincode.toString().replace(/\D/g, '');
+        }
+
         // Enhanced validation
         const validationErrors = validateFormData(formData, formType);
         if (validationErrors) {
-            return res.status(400).json({ 
-                error: 'Validation failed', 
+            return res.status(400).json({
+                error: 'Validation failed',
                 details: validationErrors,
                 fieldMappings: fieldMappings[formType]
             });
@@ -544,25 +614,25 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
 
         // Process the form with enhanced data
         const result = await formHandler.process(formData, req.user);
-        
-        res.json({ 
-            message: 'Form processed successfully.', 
+
+        res.json({
+            message: 'Form processed successfully.',
             data: result,
             timestamp: new Date().toISOString()
         });
 
     } catch (error) {
         console.error(`Form submission error for ${req.params.formType}:`, error);
-        
+
         // Enhanced error handling with specific messages
         if (error.statusCode === 402) {
-            return res.status(402).json({ 
-                error: 'Payment Required', 
+            return res.status(402).json({
+                error: 'Payment Required',
                 details: error.message,
                 code: 'INSUFFICIENT_FUNDS'
             });
         }
-        
+
         if (error.response) {
             // Pass through client website errors
             return res.status(error.response.status || 500).json({
@@ -571,15 +641,14 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
                 code: 'CLIENT_WEBSITE_ERROR'
             });
         }
-        
-        res.status(500).json({ 
+
+        res.status(500).json({
             error: 'An error occurred while processing the form.',
             details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
             code: 'INTERNAL_ERROR'
         });
     }
 });
-
 // --- THIS IS THE NEW HISTORY ENDPOINT ---
 router.get('/forms/history', authenticateToken, async (req, res) => {
     try {
@@ -617,7 +686,7 @@ router.get('/services/pricelist', authenticateToken, async (req, res) => {
         if (websites.length === 0) {
             return res.status(404).json({ error: "Associated website not found for this user." });
         }
-        
+
         const website = websites[0];
 
         // 2. Check if the website is approved

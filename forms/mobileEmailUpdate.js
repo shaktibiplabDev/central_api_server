@@ -1,6 +1,15 @@
 const { pool } = require('../config/database');
 const axios = require('axios');
 
+// --- Sanitization Utility ---
+function sanitizeText(input) {
+    if (typeof input !== 'string') return '';
+    return input
+        .replace(/[<>]/g, '') // remove HTML tags
+        .replace(/['";]/g, '') // remove quotes & semicolons
+        .trim();
+}
+
 const validators = {
     isValidAadhar: (aadhar) => /^[0-9]{12}$/.test(aadhar),
     isValidMobile: (mobile) => /^[0-9]{10}$/.test(mobile),
@@ -37,7 +46,10 @@ module.exports = {
     },
 
     process: async (data, user) => {
-        const [websites] = await pool.query("SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        const [websites] = await pool.query(
+            "SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)",
+            [user.id]
+        );
         if (websites.length === 0 || websites[0].status !== 'approved') {
             throw new Error('User does not have an approved website for submissions.');
         }
@@ -70,22 +82,22 @@ module.exports = {
 
         // Process data for PHP compatibility (no files for this form)
         const processedData = {
-            email: user.email,
+            email: sanitizeText(user.email),
             formData: {
-                full_name: data.full_name,
-                mobile_no: data.mobile_no,
-                email_id: data.email_id,
-                purpose: data.purpose,
-                aadhar_no: data.aadhar_no,
-                father_name: data.father_name || '',
+                full_name: sanitizeText(data.full_name),
+                mobile_no: sanitizeText(data.mobile_no),
+                email_id: sanitizeText(data.email_id),
+                purpose: sanitizeText(data.purpose),
+                aadhar_no: sanitizeText(data.aadhar_no),
+                father_name: sanitizeText(data.father_name || ''),
                 fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
                     if (fp && fp.id && fp.data) {
                         const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                        acc[fp.id] = cleanData;
+                        acc[sanitizeText(fp.id)] = cleanData;
                     }
                     return acc;
                 }, {}) : {},
-                missing_fingers: data.missing_fingers ? data.missing_fingers.join(',') : ''
+                missing_fingers: data.missing_fingers ? data.missing_fingers.map(f => sanitizeText(f)).join(',') : ''
             }
         };
         
@@ -105,7 +117,6 @@ module.exports = {
         }
 
         // --- NEW LOGGING FEATURE ---
-        // After the client website confirms a successful submission, we save a record.
         if (finalResponseData && finalResponseData.applicationId) {
             try {
                 await pool.query(
@@ -114,8 +125,6 @@ module.exports = {
                 );
                 console.log(`[Logger] Successfully logged submission ${finalResponseData.applicationId} for user ${user.id}`);
             } catch (logError) {
-                // If logging fails, we don't want to fail the whole request for the user.
-                // We just log this critical error to the console for you to review later.
                 console.error('CRITICAL: Failed to log a successful submission!', logError);
             }
         }
@@ -123,4 +132,3 @@ module.exports = {
         return finalResponseData; // Return the original success response to the app
     }
 };
-

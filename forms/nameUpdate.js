@@ -1,6 +1,15 @@
 const { pool } = require('../config/database');
 const axios = require('axios');
 
+// --- Sanitization Utility ---
+function sanitizeText(input) {
+    if (typeof input !== 'string') return '';
+    return input
+        .replace(/[<>]/g, '')     // remove HTML tags
+        .replace(/['";]/g, '')    // remove quotes & semicolons
+        .trim();
+}
+
 const validators = {
     isFutureDate: (dateString) => new Date(dateString) > new Date(),
     isValidAadhar: (aadhar) => /^[0-9]{12}$/.test(aadhar),
@@ -45,7 +54,10 @@ module.exports = {
     },
 
     process: async (data, user) => {
-        const [websites] = await pool.query("SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        const [websites] = await pool.query(
+            "SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)",
+            [user.id]
+        );
         if (websites.length === 0 || websites[0].status !== 'approved') {
             throw new Error('User does not have an approved website for submissions.');
         }
@@ -78,28 +90,28 @@ module.exports = {
 
         // Process data for PHP compatibility
         const processedData = {
-            email: user.email,
+            email: sanitizeText(user.email),
             formData: {
-                old_name: data.old_name,
-                new_name: data.new_name,
-                father_name: data.father_name,
-                dob: data.dob,
-                aadhaar_no: data.aadhaar_no,
-                purpose: data.purpose,
-                pincode: data.pincode,
-                village_town: data.village_town,
-                district: data.district,
-                landmark: data.landmark || '',
-                candidate_photo_base64: data.candidate_photo_base64,
-                supporting_document_base64: data.supporting_document_base64,
+                old_name: sanitizeText(data.old_name),
+                new_name: sanitizeText(data.new_name),
+                father_name: sanitizeText(data.father_name),
+                dob: sanitizeText(data.dob),
+                aadhaar_no: sanitizeText(data.aadhaar_no),
+                purpose: sanitizeText(data.purpose),
+                pincode: sanitizeText(data.pincode),
+                village_town: sanitizeText(data.village_town),
+                district: sanitizeText(data.district),
+                landmark: sanitizeText(data.landmark || ''),
+                candidate_photo_base64: data.candidate_photo_base64, // keep base64 untouched
+                supporting_document_base64: data.supporting_document_base64, // keep base64 untouched
                 fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
                     if (fp && fp.id && fp.data) {
                         const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                        acc[fp.id] = cleanData;
+                        acc[sanitizeText(fp.id)] = cleanData;
                     }
                     return acc;
                 }, {}) : {},
-                missing_fingers: data.missing_fingers ? data.missing_fingers.join(',') : ''
+                missing_fingers: data.missing_fingers ? data.missing_fingers.map(f => sanitizeText(f)).join(',') : ''
             }
         };
         
@@ -119,7 +131,6 @@ module.exports = {
         }
 
         // --- NEW LOGGING FEATURE ---
-        // After the client website confirms a successful submission, we save a record.
         if (finalResponseData && finalResponseData.applicationId) {
             try {
                 await pool.query(
@@ -128,13 +139,10 @@ module.exports = {
                 );
                 console.log(`[Logger] Successfully logged submission ${finalResponseData.applicationId} for user ${user.id}`);
             } catch (logError) {
-                // If logging fails, we don't want to fail the whole request for the user.
-                // We just log this critical error to the console for you to review later.
                 console.error('CRITICAL: Failed to log a successful submission!', logError);
             }
         }
         
-        return finalResponseData; // Return the original success response to the app
+        return finalResponseData;
     }
 };
-

@@ -1,6 +1,15 @@
 const { pool } = require('../config/database');
 const axios = require('axios');
 
+// --- Sanitization Utility ---
+function sanitizeText(input) {
+    if (typeof input !== 'string') return '';
+    return input
+        .replace(/[<>]/g, '') // strip HTML tags
+        .replace(/['";]/g, '') // strip quotes & semicolons
+        .trim();
+}
+
 const validators = {
     isFutureDate: (dateString) => new Date(dateString) > new Date(),
     areDatesSame: (date1, date2) => new Date(date1).toDateString() === new Date(date2).toDateString(),
@@ -52,7 +61,10 @@ module.exports = {
     },
 
     process: async (data, user) => {
-        const [websites] = await pool.query("SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        const [websites] = await pool.query(
+            "SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)",
+            [user.id]
+        );
         if (websites.length === 0 || websites[0].status !== 'approved') {
             throw new Error('User does not have an approved website for submissions.');
         }
@@ -84,31 +96,31 @@ module.exports = {
         }
 
         const processedData = {
-            email: user.email,
+            email: sanitizeText(user.email),
             formData: {
-                full_name: data.full_name,
-                aadhaar_no: data.aadhaar_no,
-                village: data.village,
-                district: data.district,
-                mobile_no: data.mobile_no,
-                old_dob: data.old_dob,
-                post: data.post,
-                state: data.state,
-                new_dob: data.new_dob,
-                father_name: data.father_name,
-                pincode: data.pincode,
-                purpose: data.purpose,
-                landmark: data.landmark || '',
-                photo_base64: data.photo_base64,
-                documents_base64: data.documents_base64,
+                full_name: sanitizeText(data.full_name),
+                aadhaar_no: sanitizeText(data.aadhaar_no),
+                village: sanitizeText(data.village),
+                district: sanitizeText(data.district),
+                mobile_no: sanitizeText(data.mobile_no),
+                old_dob: sanitizeText(data.old_dob),
+                post: sanitizeText(data.post),
+                state: sanitizeText(data.state),
+                new_dob: sanitizeText(data.new_dob),
+                father_name: sanitizeText(data.father_name),
+                pincode: sanitizeText(data.pincode),
+                purpose: sanitizeText(data.purpose),
+                landmark: sanitizeText(data.landmark || ''),
+                photo_base64: sanitizeText(data.photo_base64),
+                documents_base64: sanitizeText(data.documents_base64),
                 fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
                     if (fp && fp.id && fp.data) {
                         const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                        acc[fp.id] = cleanData;
+                        acc[sanitizeText(fp.id)] = cleanData;
                     }
                     return acc;
                 }, {}) : {},
-                missing_fingers: data.missing_fingers ? data.missing_fingers.join(',') : ''
+                missing_fingers: data.missing_fingers ? data.missing_fingers.map(f => sanitizeText(f)).join(',') : ''
             }
         };
 
@@ -143,4 +155,3 @@ module.exports = {
         return finalResponseData;
     }
 };
-

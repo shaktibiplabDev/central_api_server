@@ -1,10 +1,32 @@
 const { pool } = require('../config/database');
 const axios = require('axios');
 
+// --- Validators ---
 const validators = {
-    isValidAadhar: (aadhar) => /^[0-9]{12}$/.test(aadhar),
-    isValidMobile: (mobile) => /^[0-9]{10}$/.test(mobile),
-    isValidPincode: (pincode) => /^[0-9]{6}$/.test(pincode),
+    isValidAadhar: (aadhar) => /^[0-9]{12}$/.test(aadhaarSanitize(aadhar)),
+    isValidMobile: (mobile) => /^[0-9]{10}$/.test(mobileSanitize(mobile)),
+    isValidPincode: (pincode) => /^[0-9]{6}$/.test(pincodeSanitize(pincode)),
+};
+
+// --- Sanitization functions ---
+const textSanitize = (text, maxLength) => {
+    if (!text) return '';
+    return text.toString().trim().slice(0, maxLength);
+};
+
+const aadhaarSanitize = (aadhaar) => {
+    if (!aadhaar) return '';
+    return aadhaar.toString().replace(/\D/g, '').slice(0, 12); // only digits, max 12
+};
+
+const mobileSanitize = (mobile) => {
+    if (!mobile) return '';
+    return mobile.toString().replace(/\D/g, '').slice(0, 10); // only digits, max 10
+};
+
+const pincodeSanitize = (pincode) => {
+    if (!pincode) return '';
+    return pincode.toString().replace(/\D/g, '').slice(0, 6); // only digits, max 6
 };
 
 module.exports = {
@@ -36,13 +58,16 @@ module.exports = {
         if ((capturedFingers + missingFingers) < 6) {
             return 'A total of at least 6 fingerprints must be captured or marked as missing.';
         }
-        
+
         return null;
     },
 
     process: async (data, user) => {
         // Step 1: Get user's approved website details
-        const [websites] = await pool.query("SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        const [websites] = await pool.query(
+            "SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)",
+            [user.id]
+        );
         if (websites.length === 0 || websites[0].status !== 'approved') {
             throw new Error('User does not have an approved website for submissions.');
         }
@@ -75,26 +100,23 @@ module.exports = {
             throw error;
         }
 
-        // Process fingerprints for PHP compatibility
+        // Step 4: Sanitize data before sending
         const processedData = {
             email: user.email,
             formData: {
-                // Map fields according to PHP form expectations
-                full_name: data.full_name,
-                aadhaar_no: data.aadhaar_no,
-                village: data.village,
-                district: data.district,
-                mobile_no: data.mobile_no,
-                post: data.post,
-                state: data.state,
-                pincode: data.pincode,
-                purpose: data.purpose,
-                landmark: data.landmark || '',
+                full_name: textSanitize(data.full_name, 100),
+                aadhaar_no: aadhaarSanitize(data.aadhaar_no),
+                village: textSanitize(data.village, 100),
+                district: textSanitize(data.district, 50),
+                mobile_no: mobileSanitize(data.mobile_no),
+                post: textSanitize(data.post, 50),
+                state: textSanitize(data.state, 50),
+                pincode: pincodeSanitize(data.pincode),
+                purpose: textSanitize(data.purpose, 100),
+                landmark: textSanitize(data.landmark, 100),
                 document_base64: data.document_base64,
-                // Process fingerprints for PHP format
                 fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
                     if (fp && fp.id && fp.data) {
-                        // Remove base64 prefix for PHP compatibility
                         const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
                         acc[fp.id] = cleanData;
                     }
@@ -104,14 +126,11 @@ module.exports = {
             }
         };
 
-        // Step 4: Submit to client website
+        // Step 5: Submit to client website
         let finalResponseData;
         try {
             const submitUrl = `${website.url}/api/forms/address-update`;
-            const response = await axios.post(submitUrl, processedData, { 
-                headers, 
-                timeout: 45000 
-            });
+            const response = await axios.post(submitUrl, processedData, { headers, timeout: 45000 });
             finalResponseData = response.data;
         } catch (error) {
             const errorMessage = error.response ? 
@@ -120,8 +139,7 @@ module.exports = {
             throw new Error(errorMessage);
         }
 
-        // --- NEW LOGGING FEATURE ---
-        // After the client website confirms a successful submission, we save a record.
+        // Step 6: Log submission
         if (finalResponseData && finalResponseData.applicationId) {
             try {
                 await pool.query(
@@ -130,13 +148,10 @@ module.exports = {
                 );
                 console.log(`[Logger] Successfully logged submission ${finalResponseData.applicationId} for user ${user.id}`);
             } catch (logError) {
-                // If logging fails, we don't want to fail the whole request for the user.
-                // We just log this critical error to the console for you to review later.
                 console.error('CRITICAL: Failed to log a successful submission!', logError);
             }
         }
-        
-        return finalResponseData; // Return the original success response to the app
+
+        return finalResponseData;
     }
 };
-
