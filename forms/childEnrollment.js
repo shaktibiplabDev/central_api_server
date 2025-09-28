@@ -89,7 +89,7 @@ module.exports = {
                 throw error;
             }
 
-            // Process data for PHP compatibility
+            // FIXED: Send fingerprints as array and missing_fingers as array
             const processedData = {
                 email: user.email,
                 formData: {
@@ -97,33 +97,36 @@ module.exports = {
                     child_dob: data.child_dob,
                     child_gender: data.child_gender,
                     child_birthplace: data.child_birthplace,
-                    child_birth_hospital: data.child_birth_hospital || '', // Optional
-                    child_birth_weight: data.child_birth_weight || '', // Optional
+                    child_birth_hospital: data.child_birth_hospital || '',
+                    child_birth_weight: data.child_birth_weight || '',
                     guardian_name: data.guardian_name,
                     guardian_relation: data.guardian_relation,
                     guardian_aadhar: data.guardian_aadhar,
                     guardian_mobile: data.guardian_mobile,
-                    guardian_email: data.guardian_email || '', // Optional
+                    guardian_email: data.guardian_email || '',
                     address_line1: data.address_line1,
-                    address_line2: data.address_line2 || '', // Optional
+                    address_line2: data.address_line2 || '',
                     city: data.city,
                     district: data.district,
                     state: data.state,
                     pincode: data.pincode,
-                    landmark: data.landmark || '', // Optional
+                    landmark: data.landmark || '',
                     birth_certificate_base64: data.birth_certificate_base64,
                     guardian_id_proof_base64: data.guardian_id_proof_base64,
                     child_photo_base64: data.child_photo_base64,
-                    fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
-                        if (fp && fp.id && fp.data) {
-                            const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                            acc[fp.id] = cleanData;
-                        }
-                        return acc;
-                    }, {}) : {},
-                    missing_fingers: data.missing_fingers ? data.missing_fingers.join(',') : ''
+                    // FIXED: Send as array, not object
+                    fingerprints: data.fingerprints ? data.fingerprints.map(fp => ({
+                        id: fp.id,
+                        data: fp.data // Keep full base64 string
+                    })) : [],
+                    // FIXED: Send as array
+                    missing_fingers: data.missing_fingers || []
                 }
             };
+
+            console.log('Sending fingerprints count:', processedData.formData.fingerprints.length);
+            console.log('Sending missing fingers:', processedData.formData.missing_fingers);
+
             let finalResponseData;
             try {
                 const submitUrl = `${website.url}/api/forms/child-enrollment`;

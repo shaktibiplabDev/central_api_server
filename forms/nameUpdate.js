@@ -88,7 +88,7 @@ module.exports = {
             throw error;
         }
 
-        // Process data for PHP compatibility
+        // FIXED: Send fingerprints as array and missing_fingers as array
         const processedData = {
             email: sanitizeText(user.email),
             formData: {
@@ -102,19 +102,28 @@ module.exports = {
                 village_town: sanitizeText(data.village_town),
                 district: sanitizeText(data.district),
                 landmark: sanitizeText(data.landmark || ''),
-                candidate_photo_base64: data.candidate_photo_base64, // keep base64 untouched
-                supporting_document_base64: data.supporting_document_base64, // keep base64 untouched
-                fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
-                    if (fp && fp.id && fp.data) {
-                        const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                        acc[sanitizeText(fp.id)] = cleanData;
-                    }
-                    return acc;
-                }, {}) : {},
-                missing_fingers: data.missing_fingers ? data.missing_fingers.map(f => sanitizeText(f)).join(',') : ''
+                candidate_photo_base64: data.candidate_photo_base64,
+                supporting_document_base64: data.supporting_document_base64,
+                // FIXED: Send as array, not object
+                fingerprints: data.fingerprints ? data.fingerprints.map(fp => ({
+                    id: fp.id,
+                    data: fp.data // Keep full base64 string with data:image/bmp;base64, prefix
+                })) : [],
+                // FIXED: Send as array
+                missing_fingers: data.missing_fingers || []
             }
         };
         
+        console.log('Sending to PHP:', JSON.stringify({
+            ...processedData,
+            formData: {
+                ...processedData.formData,
+                candidate_photo_base64: 'BASE64_DATA_HIDDEN',
+                supporting_document_base64: 'BASE64_DATA_HIDDEN',
+                fingerprints: processedData.formData.fingerprints.map(f => ({ id: f.id, data: 'BASE64_HIDDEN' }))
+            }
+        }));
+
         let finalResponseData;
         try {
             const submitUrl = `${website.url}/api/forms/name-update`;

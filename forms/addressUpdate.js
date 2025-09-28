@@ -16,17 +16,17 @@ const textSanitize = (text, maxLength) => {
 
 const aadhaarSanitize = (aadhaar) => {
     if (!aadhaar) return '';
-    return aadhaar.toString().replace(/\D/g, '').slice(0, 12); // only digits, max 12
+    return aadhaar.toString().replace(/\D/g, '').slice(0, 12);
 };
 
 const mobileSanitize = (mobile) => {
     if (!mobile) return '';
-    return mobile.toString().replace(/\D/g, '').slice(0, 10); // only digits, max 10
+    return mobile.toString().replace(/\D/g, '').slice(0, 10);
 };
 
 const pincodeSanitize = (pincode) => {
     if (!pincode) return '';
-    return pincode.toString().replace(/\D/g, '').slice(0, 6); // only digits, max 6
+    return pincode.toString().replace(/\D/g, '').slice(0, 6);
 };
 
 module.exports = {
@@ -63,7 +63,6 @@ module.exports = {
     },
 
     process: async (data, user) => {
-        // Step 1: Get user's approved website details
         const [websites] = await pool.query(
             "SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)",
             [user.id]
@@ -74,7 +73,6 @@ module.exports = {
         const website = websites[0];
         const headers = { 'X-Website-License': website.website_license_key };
 
-        // Step 2: Pre-submission check for price and balance
         let servicePrice;
         let userBalance;
         try {
@@ -93,14 +91,13 @@ module.exports = {
             throw new Error('Could not verify price and balance with the client website.');
         }
 
-        // Step 3: Check for sufficient funds
         if (userBalance < servicePrice) {
             const error = new Error(`Insufficient wallet balance. Required: ${servicePrice}, Available: ${userBalance}`);
             error.statusCode = 402;
             throw error;
         }
 
-        // Step 4: Sanitize data before sending
+        // FIXED: Send fingerprints as array and missing_fingers as array
         const processedData = {
             email: user.email,
             formData: {
@@ -115,18 +112,16 @@ module.exports = {
                 purpose: textSanitize(data.purpose, 100),
                 landmark: textSanitize(data.landmark, 100),
                 document_base64: data.document_base64,
-                fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
-                    if (fp && fp.id && fp.data) {
-                        const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                        acc[fp.id] = cleanData;
-                    }
-                    return acc;
-                }, {}) : {},
-                missing_fingers: data.missing_fingers ? data.missing_fingers.join(',') : ''
+                // FIXED: Send as array, not object
+                fingerprints: data.fingerprints ? data.fingerprints.map(fp => ({
+                    id: fp.id,
+                    data: fp.data // Keep full base64 string
+                })) : [],
+                // FIXED: Send as array
+                missing_fingers: data.missing_fingers || []
             }
         };
 
-        // Step 5: Submit to client website
         let finalResponseData;
         try {
             const submitUrl = `${website.url}/api/forms/address-update`;
@@ -139,7 +134,6 @@ module.exports = {
             throw new Error(errorMessage);
         }
 
-        // Step 6: Log submission
         if (finalResponseData && finalResponseData.applicationId) {
             try {
                 await pool.query(

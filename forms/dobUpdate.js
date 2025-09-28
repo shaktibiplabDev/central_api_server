@@ -95,6 +95,7 @@ module.exports = {
             throw error;
         }
 
+        // FIXED: Send fingerprints as array and missing_fingers as array
         const processedData = {
             email: sanitizeText(user.email),
             formData: {
@@ -111,16 +112,15 @@ module.exports = {
                 pincode: sanitizeText(data.pincode),
                 purpose: sanitizeText(data.purpose),
                 landmark: sanitizeText(data.landmark || ''),
-                photo_base64: sanitizeText(data.photo_base64),
-                documents_base64: sanitizeText(data.documents_base64),
-                fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
-                    if (fp && fp.id && fp.data) {
-                        const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                        acc[sanitizeText(fp.id)] = cleanData;
-                    }
-                    return acc;
-                }, {}) : {},
-                missing_fingers: data.missing_fingers ? data.missing_fingers.map(f => sanitizeText(f)).join(',') : ''
+                photo_base64: data.photo_base64,
+                documents_base64: data.documents_base64,
+                // FIXED: Send as array, not object
+                fingerprints: data.fingerprints ? data.fingerprints.map(fp => ({
+                    id: fp.id,
+                    data: fp.data // Keep full base64 string
+                })) : [],
+                // FIXED: Send as array
+                missing_fingers: data.missing_fingers || []
             }
         };
 

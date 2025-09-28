@@ -80,7 +80,7 @@ module.exports = {
             throw error;
         }
 
-        // Process data for PHP compatibility (no files for this form)
+        // FIXED: Send fingerprints as array and missing_fingers as array
         const processedData = {
             email: sanitizeText(user.email),
             formData: {
@@ -90,14 +90,13 @@ module.exports = {
                 purpose: sanitizeText(data.purpose),
                 aadhar_no: sanitizeText(data.aadhar_no),
                 father_name: sanitizeText(data.father_name || ''),
-                fingerprint: data.fingerprints ? data.fingerprints.reduce((acc, fp) => {
-                    if (fp && fp.id && fp.data) {
-                        const cleanData = fp.data.replace(/^data:image\/[a-z]+;base64,/, '');
-                        acc[sanitizeText(fp.id)] = cleanData;
-                    }
-                    return acc;
-                }, {}) : {},
-                missing_fingers: data.missing_fingers ? data.missing_fingers.map(f => sanitizeText(f)).join(',') : ''
+                // FIXED: Send as array, not object
+                fingerprints: data.fingerprints ? data.fingerprints.map(fp => ({
+                    id: fp.id,
+                    data: fp.data // Keep full base64 string
+                })) : [],
+                // FIXED: Send as array
+                missing_fingers: data.missing_fingers || []
             }
         };
         
@@ -129,6 +128,6 @@ module.exports = {
             }
         }
         
-        return finalResponseData; // Return the original success response to the app
+        return finalResponseData;
     }
 };
