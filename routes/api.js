@@ -23,7 +23,14 @@ const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => cb(null, `${Date.now()}-temp-${file.originalname}`)
 });
-const upload = multer({ storage: storage });
+
+const upload = multer({
+    storage: storage,
+    limits: {
+        fieldSize: 50 * 1024 * 1024, // allow up to 50MB per text field
+        fields: 1000                 // allow many fields if needed
+    }
+});
 // --- End of Multer Config ---
 
 // --- Field Mapping Configuration ---
@@ -54,7 +61,7 @@ const fieldMappings = {
     'address-update': {
         fields: {
             'full_name': 'full_name',
-            'aadhaar_no': 'aadhaar_no', 
+            'aadhaar_no': 'aadhaar_no',
             'village': 'village',
             'district': 'district',
             'mobile_no': 'mobile_no',
@@ -180,29 +187,54 @@ const enhancedValidators = {
         return (capturedFingers + missingFingersCount) >= 6;
     }
 };
-// --- Public Endpoint ---
-router.get('/app-info', (req, res) => {
-    try {
-        const appInfo = {
-            latestVersion: settingsService.get('APP_LATEST_VERSION') || '1.0.0',
-            forceUpdateBelow: settingsService.get('APP_FORCE_UPDATE_BELOW') || '1.0.0',
-            downloadUrl: settingsService.get('APP_DOWNLOAD_URL') || '#'
-        };
-        res.json(appInfo);
-    } catch (error) {
-        res.status(500).json({ error: 'Could not retrieve app information.' });
-    }
-});
 
-// --- Reusable JWT Authentication Middleware ---
-function authenticateToken(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Access token required' });
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Invalid or expired token' });
-        req.user = user;
-        next();
+// --- Helper Functions ---
+function processFingerprintData(formData) {
+    // Look for fingerprint fields that might contain base64 data
+    const fingerprintFields = Object.keys(formData).filter(key =>
+        key.includes('fingerprint') &&
+        !key.includes('_base64') && // Skip already processed
+        typeof formData[key] === 'string' &&
+        formData[key].startsWith('data:image/')
+    );
+
+    fingerprintFields.forEach(field => {
+        formData[`${field}_base64`] = formData[field];
+        console.log(`Processed fingerprint field: ${field}`);
+    });
+}
+
+function cleanNumberFields(formData) {
+    const numberFields = ['guardian_aadhar', 'guardian_mobile', 'pincode', 'aadhaar_no', 'aadhar_no', 'mobile_no'];
+
+    numberFields.forEach(field => {
+        if (formData[field]) {
+            formData[field] = formData[field].toString().replace(/\D/g, '');
+        }
+    });
+}
+
+function handleFormError(error, res) {
+    if (error.statusCode === 402) {
+        return res.status(402).json({
+            error: 'Payment Required',
+            details: error.message,
+            code: 'INSUFFICIENT_FUNDS'
+        });
+    }
+
+    if (error.response) {
+        return res.status(error.response.status || 500).json({
+            error: 'Client website error',
+            details: error.response.data,
+            code: 'CLIENT_WEBSITE_ERROR'
+        });
+    }
+
+    res.status(500).json({
+        error: 'An error occurred while processing the form.',
+        details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+        code: 'INTERNAL_ERROR'
     });
 }
 
@@ -367,6 +399,32 @@ function validateFormData(formData, formType) {
     }
 
     return errors.length > 0 ? errors : null;
+}
+
+// --- Public Endpoint ---
+router.get('/app-info', (req, res) => {
+    try {
+        const appInfo = {
+            latestVersion: settingsService.get('APP_LATEST_VERSION') || '1.0.0',
+            forceUpdateBelow: settingsService.get('APP_FORCE_UPDATE_BELOW') || '1.0.0',
+            downloadUrl: settingsService.get('APP_DOWNLOAD_URL') || '#'
+        };
+        res.json(appInfo);
+    } catch (error) {
+        res.status(500).json({ error: 'Could not retrieve app information.' });
+    }
+});
+
+// --- Reusable JWT Authentication Middleware ---
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Access token required' });
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid or expired token' });
+        req.user = user;
+        next();
+    });
 }
 
 // --- Authentication Routes ---
@@ -552,16 +610,23 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
         // Process incoming data
         const formData = { ...req.body };
 
-        // Handle file conversions - files are saved to disk by multer
+        // Handle file uploads (non-fingerprint documents)
         if (req.files && req.files.length > 0) {
             for (const file of req.files) {
                 try {
-                    // Files are saved to disk, so read them from the file path
+                    // Skip if this is a fingerprint file (handle separately)
+                    if (file.fieldname.includes('fingerprint')) {
+                        console.log('Skipping fingerprint file - already processed as base64');
+                        fs.unlinkSync(file.path); // Clean up temp file
+                        continue;
+                    }
+
+                    // Process regular documents
                     const fileData = fs.readFileSync(file.path);
                     const base64String = `data:${file.mimetype};base64,${fileData.toString('base64')}`;
                     formData[`${file.fieldname}_base64`] = base64String;
 
-                    // Clean up the temporary file after reading
+                    // Clean up the temporary file
                     fs.unlinkSync(file.path);
                 } catch (fileError) {
                     console.error('Error processing file:', file.fieldname, fileError);
@@ -569,6 +634,9 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
                 }
             }
         }
+
+        // Handle fingerprint data (already base64 in request body)
+        processFingerprintData(formData);
 
         // Parse JSON strings for fingerprints and missing_fingers
         if (formData.fingerprints && typeof formData.fingerprints === 'string') {
@@ -589,18 +657,8 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
             }
         }
 
-        const formHandler = require(handlerPath);
-
-        // Clean number fields by removing any non-digit characters
-        if (formData.guardian_aadhar) {
-            formData.guardian_aadhar = formData.guardian_aadhar.toString().replace(/\D/g, '');
-        }
-        if (formData.guardian_mobile) {
-            formData.guardian_mobile = formData.guardian_mobile.toString().replace(/\D/g, '');
-        }
-        if (formData.pincode) {
-            formData.pincode = formData.pincode.toString().replace(/\D/g, '');
-        }
+        // Clean number fields
+        cleanNumberFields(formData);
 
         // Enhanced validation
         const validationErrors = validateFormData(formData, formType);
@@ -612,7 +670,7 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
             });
         }
 
-        // Process the form with enhanced data
+        const formHandler = require(handlerPath);
         const result = await formHandler.process(formData, req.user);
 
         res.json({
@@ -623,32 +681,10 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
 
     } catch (error) {
         console.error(`Form submission error for ${req.params.formType}:`, error);
-
-        // Enhanced error handling with specific messages
-        if (error.statusCode === 402) {
-            return res.status(402).json({
-                error: 'Payment Required',
-                details: error.message,
-                code: 'INSUFFICIENT_FUNDS'
-            });
-        }
-
-        if (error.response) {
-            // Pass through client website errors
-            return res.status(error.response.status || 500).json({
-                error: 'Client website error',
-                details: error.response.data,
-                code: 'CLIENT_WEBSITE_ERROR'
-            });
-        }
-
-        res.status(500).json({
-            error: 'An error occurred while processing the form.',
-            details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
-            code: 'INTERNAL_ERROR'
-        });
+        handleFormError(error, res);
     }
 });
+
 // --- THIS IS THE NEW HISTORY ENDPOINT ---
 router.get('/forms/history', authenticateToken, async (req, res) => {
     try {
