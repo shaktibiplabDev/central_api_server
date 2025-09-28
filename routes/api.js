@@ -728,7 +728,7 @@ router.get('/forms/history', authenticateToken, async (req, res) => {
 // --- NEW ENDPOINT: Get a website's full price list for display in the app ---
 router.get('/services/pricelist', authenticateToken, async (req, res) => {
     try {
-        const user = req.user; // User object from JWT
+        const user = req.user;
 
         // 1. Get the user's website details from our database
         const [websites] = await pool.query(
@@ -752,21 +752,49 @@ router.get('/services/pricelist', authenticateToken, async (req, res) => {
 
         const response = await axios.get(clientApiUrl, {
             headers: {
-                // The secret key proves this request is from our trusted server
                 'X-Website-License': website.website_license_key
             },
             timeout: 15000
         });
 
-        // 4. Relay the price list back to the mobile app
-        res.json(response.data);
+        // 4. Return the complete price list data with all fields and metadata
+        const priceData = response.data || [];
+        
+        res.json({
+            success: true,
+            data: priceData,
+            metadata: {
+                total_services: priceData.length,
+                active_services: priceData.filter(service => service.is_active).length,
+                inactive_services: priceData.filter(service => !service.is_active).length,
+                assignable_services: priceData.filter(service => service.is_assignable).length,
+                timestamp: new Date().toISOString(),
+                website_url: website.url
+            }
+        });
 
     } catch (error) {
         console.error(`Error fetching price list for user ${req.user.id}:`, error.message);
+        
         if (error.response) {
-            return res.status(error.response.status).json({ error: 'An error occurred on the client website.', details: error.response.data });
+            return res.status(error.response.status).json({ 
+                success: false,
+                error: 'An error occurred on the client website.', 
+                details: error.response.data 
+            });
         }
-        res.status(500).json({ error: 'Internal server error while fetching price list.' });
+        
+        if (error.code === 'ECONNABORTED') {
+            return res.status(408).json({ 
+                success: false,
+                error: 'Request timeout - client website took too long to respond.' 
+            });
+        }
+        
+        res.status(500).json({ 
+            success: false,
+            error: 'Internal server error while fetching price list.' 
+        });
     }
 });
 
