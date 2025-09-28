@@ -238,7 +238,7 @@ function handleFormError(error, res) {
     });
 }
 
-// --- Enhanced Form Data Processor ---
+// --- FIXED Form Data Processor ---
 function processFormData(formData, formType) {
     const mapping = fieldMappings[formType];
     if (!mapping) {
@@ -264,20 +264,17 @@ function processFormData(formData, formType) {
         }
     }
 
-    // Process fingerprints - convert to PHP format
+    // FIXED: Process fingerprints - send as array directly to PHP
     if (formData.fingerprints && Array.isArray(formData.fingerprints)) {
-        const phpFingerprints = {};
-        formData.fingerprints.forEach(fp => {
-            if (fp && fp.id && fp.data) {
-                phpFingerprints[fp.id] = fp.data; // Remove base64 prefix for PHP compatibility
-            }
-        });
-        processedData.fields.fingerprint = phpFingerprints;
+        processedData.fields.fingerprints = formData.fingerprints.map(fp => ({
+            id: fp.id,
+            data: fp.data // Keep the full base64 string with data URI
+        }));
     }
 
-    // Process missing fingers
+    // FIXED: Process missing fingers - send as array directly to PHP
     if (formData.missing_fingers && Array.isArray(formData.missing_fingers)) {
-        processedData.fields.missing_fingers = formData.missing_fingers.join(',');
+        processedData.fields.missing_fingers = formData.missing_fingers;
     }
 
     return processedData;
@@ -586,7 +583,7 @@ router.get('/user/wallet', authenticateToken, async (req, res) => {
     }
 });
 
-// --- ENHANCED FORM SUBMISSION ENDPOINT ---
+// --- FIXED FORM SUBMISSION ENDPOINT ---
 router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res) => {
     try {
         const { formType } = req.params;
@@ -610,8 +607,15 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
         // Process incoming data
         const formData = { ...req.body };
 
+        console.log('=== RAW FORM DATA RECEIVED ===');
+        console.log('Form type:', formType);
+        console.log('Fields received:', Object.keys(formData));
+        console.log('Fingerprints present:', !!formData.fingerprints);
+        console.log('Missing fingers present:', !!formData.missing_fingers);
+
         // Handle file uploads (non-fingerprint documents)
         if (req.files && req.files.length > 0) {
+            console.log('Files received:', req.files.length);
             for (const file of req.files) {
                 try {
                     // Skip if this is a fingerprint file (handle separately)
@@ -625,6 +629,7 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
                     const fileData = fs.readFileSync(file.path);
                     const base64String = `data:${file.mimetype};base64,${fileData.toString('base64')}`;
                     formData[`${file.fieldname}_base64`] = base64String;
+                    console.log(`Processed file: ${file.fieldname}`);
 
                     // Clean up the temporary file
                     fs.unlinkSync(file.path);
@@ -635,13 +640,11 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
             }
         }
 
-        // Handle fingerprint data (already base64 in request body)
-        processFingerprintData(formData);
-
         // Parse JSON strings for fingerprints and missing_fingers
         if (formData.fingerprints && typeof formData.fingerprints === 'string') {
             try {
                 formData.fingerprints = JSON.parse(formData.fingerprints);
+                console.log('Parsed fingerprints from JSON string');
             } catch (e) {
                 console.error('Invalid fingerprints JSON:', e);
                 formData.fingerprints = [];
@@ -651,10 +654,21 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
         if (formData.missing_fingers && typeof formData.missing_fingers === 'string') {
             try {
                 formData.missing_fingers = JSON.parse(formData.missing_fingers);
+                console.log('Parsed missing_fingers from JSON string');
             } catch (e) {
                 console.error('Invalid missing_fingers JSON:', e);
                 formData.missing_fingers = [];
             }
+        }
+
+        // Log fingerprint data for debugging
+        if (formData.fingerprints) {
+            console.log('Fingerprints count:', formData.fingerprints.length);
+            console.log('Fingerprints data sample:', formData.fingerprints.slice(0, 1)); // Log first fingerprint only
+        }
+
+        if (formData.missing_fingers) {
+            console.log('Missing fingers:', formData.missing_fingers);
         }
 
         // Clean number fields
@@ -663,6 +677,7 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
         // Enhanced validation
         const validationErrors = validateFormData(formData, formType);
         if (validationErrors) {
+            console.log('Validation errors:', validationErrors);
             return res.status(400).json({
                 error: 'Validation failed',
                 details: validationErrors,
@@ -670,8 +685,10 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
             });
         }
 
+        console.log('=== CALLING FORM HANDLER ===');
         const formHandler = require(handlerPath);
         const result = await formHandler.process(formData, req.user);
+        console.log('=== FORM HANDLER COMPLETED ===');
 
         res.json({
             message: 'Form processed successfully.',
