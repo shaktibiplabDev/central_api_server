@@ -748,7 +748,7 @@ router.get('/services/pricelist', authenticateToken, async (req, res) => {
         }
 
         // 3. Proxy the request to the client website to get their full price list
-        const clientApiUrl = `${website.url}/api/prices`;
+        const clientApiUrl = `${website.url}/api/prices/full-list`;
 
         const response = await axios.get(clientApiUrl, {
             headers: {
