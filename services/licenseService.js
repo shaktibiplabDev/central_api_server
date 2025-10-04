@@ -11,6 +11,19 @@ class LicenseService {
         this.licenseBoxApiKey = process.env.LICENSE_BOX_API_KEY;
         this.licenseBoxProductId = process.env.LICENSE_BOX_PRODUCT_ID;
         
+        // Bind all methods to maintain 'this' context
+        this.checkUserLicense = this.checkUserLicense.bind(this);
+        this.checkWebsiteLicense = this.checkWebsiteLicense.bind(this);
+        this.resolveDomainIp = this.resolveDomainIp.bind(this);
+        this.generateCheckToken = this.generateCheckToken.bind(this);
+        this.parseWhmcsResponse = this.parseWhmcsResponse.bind(this);
+        this.determineLicenseStatus = this.determineLicenseStatus.bind(this);
+        this.verifyMd5Hash = this.verifyMd5Hash.bind(this);
+        this.isLicenseBoxResponseValid = this.isLicenseBoxResponseValid.bind(this);
+        this.maskLicenseKey = this.maskLicenseKey.bind(this);
+        this.log = this.log.bind(this);
+        this.validateConfig = this.validateConfig.bind(this);
+        
         this.validateConfig();
     }
 
