@@ -23,6 +23,7 @@ class LicenseService {
         this.maskLicenseKey = this.maskLicenseKey.bind(this);
         this.log = this.log.bind(this);
         this.validateConfig = this.validateConfig.bind(this);
+        this.extractDomainFromUrl = this.extractDomainFromUrl.bind(this);
         
         this.validateConfig();
     }
@@ -81,7 +82,8 @@ class LicenseService {
             this.log('info', 'Sending request to WHMCS API', {
                 licenseKey: this.maskLicenseKey(licenseKey),
                 domain: options.domain,
-                ip: resolvedIp
+                resolvedIp: resolvedIp,
+                originalIp: options.ip
             });
             
             const { data: responseBody } = await axios.post(
@@ -106,7 +108,8 @@ class LicenseService {
             this.log('info', 'License check completed', {
                 licenseKey: this.maskLicenseKey(licenseKey),
                 status,
-                domain: options.domain
+                domain: options.domain,
+                ipUsed: resolvedIp
             });
             
             return { 
@@ -152,7 +155,7 @@ class LicenseService {
         }
         
         try {
-            const resolvedIp = await this.resolveDomainIp(options.websiteUrl, '127.0.0.1');
+            const resolvedIp = await this.resolveDomainIp(options.websiteUrl, options.ip || '127.0.0.1');
             
             const headers = {
                 'LB-API-KEY': this.licenseBoxApiKey,
@@ -171,7 +174,9 @@ class LicenseService {
 
             this.log('info', 'Sending request to License Box API', {
                 licenseKey: this.maskLicenseKey(licenseKey),
-                websiteUrl: options.websiteUrl
+                websiteUrl: options.websiteUrl,
+                resolvedIp: resolvedIp,
+                originalIp: options.ip
             });
             
             const response = await axios.post(
@@ -196,7 +201,8 @@ class LicenseService {
             this.log('info', 'License Box check completed', {
                 licenseKey: this.maskLicenseKey(licenseKey),
                 isValid,
-                websiteUrl: options.websiteUrl
+                websiteUrl: options.websiteUrl,
+                ipUsed: resolvedIp
             });
 
             return { isValid, message };
@@ -220,16 +226,59 @@ class LicenseService {
     }
 
     // Helper methods
-    async resolveDomainIp(domain, fallbackIp = '') {
-        if (!domain) return fallbackIp;
+    async resolveDomainIp(domainOrUrl, fallbackIp = '') {
+        if (!domainOrUrl) {
+            this.log('debug', 'No domain provided, using fallback IP', { fallbackIp });
+            return fallbackIp;
+        }
 
         try {
-            const parsedUrl = new url.URL(domain);
-            const { address } = await dns.lookup(parsedUrl.hostname);
-            return address;
+            // Extract domain from URL if it's a full URL
+            const domain = this.extractDomainFromUrl(domainOrUrl);
+            
+            this.log('debug', 'Resolving domain IP', { 
+                input: domainOrUrl, 
+                extractedDomain: domain 
+            });
+
+            const addresses = await dns.lookup(domain, { all: false });
+            const ip = addresses.address;
+            
+            this.log('info', 'Successfully resolved domain IP', { 
+                domain, 
+                ip 
+            });
+            
+            return ip;
         } catch (dnsError) {
-            this.log('warn', `Could not resolve IP for domain: ${domain}`, { error: dnsError.message });
+            this.log('warn', `Could not resolve IP for domain: ${domainOrUrl}`, { 
+                error: dnsError.message,
+                fallbackIp 
+            });
             return fallbackIp;
+        }
+    }
+
+    extractDomainFromUrl(input) {
+        if (!input) return '';
+        
+        // If it's already a domain (no protocol), return as is
+        if (!input.includes('://') && !input.includes('/')) {
+            return input;
+        }
+        
+        try {
+            // Add protocol if missing to make it a valid URL
+            const urlString = input.includes('://') ? input : `https://${input}`;
+            const parsedUrl = new URL(urlString);
+            return parsedUrl.hostname;
+        } catch (error) {
+            this.log('warn', 'Failed to parse URL, treating as domain', { 
+                input, 
+                error: error.message 
+            });
+            // If URL parsing fails, try to extract domain manually
+            return input.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0];
         }
     }
 
