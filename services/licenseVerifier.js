@@ -1,109 +1,347 @@
 const { pool } = require('../config/database');
-const settingsService = require('./settingsService');
 const dns = require('dns').promises;
 const url = require('url');
-const axios = require('axios'); // We need axios for the price list call
+const cron = require('node-cron');
 
-const verifier = {
+class LicenseVerifier {
+    constructor() {
+        this.cronJob = null;
+        this.isRunning = false;
+        this.licenseService = require('./licenseService');
+        this.batchSize = parseInt(process.env.LICENSE_BATCH_SIZE) || 50;
+        
+        this.validateDatabasePool();
+    }
+
+    validateDatabasePool() {
+        if (!pool) {
+            throw new Error('Database pool is not initialized');
+        }
+    }
+
     /**
-     * This function is now the main background worker task.
-     * It runs the full verification and synchronization cycle.
+     * Start the automatic license verification scheduler
+     */
+    startScheduler() {
+        const schedule = process.env.LICENSE_CHECK_CRON || '*/15 * * * *';
+        
+        if (!cron.validate(schedule)) {
+            throw new Error(`Invalid cron schedule: ${schedule}`);
+        }
+
+        this.log('info', 'Starting license verification scheduler', { schedule });
+        
+        // Run immediately on startup with delay to allow app to fully initialize
+        setTimeout(() => {
+            this.runVerificationCycle().catch(error => {
+                this.log('error', 'Initial verification cycle failed', { error: error.message });
+            });
+        }, 30000); // 30 second delay
+        
+        // Then run on schedule
+        this.cronJob = cron.schedule(schedule, () => {
+            this.log('info', 'Running scheduled license verification');
+            this.runVerificationCycle().catch(error => {
+                this.log('error', 'Scheduled verification cycle failed', { error: error.message });
+            });
+        });
+        
+        this.cronJob.start();
+        
+        this.log('info', 'License verification scheduler started successfully');
+    }
+
+    /**
+     * Stop the scheduler (for graceful shutdown)
+     */
+    stopScheduler() {
+        if (this.cronJob) {
+            this.cronJob.stop();
+            this.log('info', 'License verification scheduler stopped');
+        }
+    }
+
+    /**
+     * Main verification cycle
      */
     async runVerificationCycle() {
-        console.log(`[WORKER] Running verification cycle...`);
-        const licenseService = require('./licenseService');
+        if (this.isRunning) {
+            this.log('warn', 'Verification cycle already running, skipping');
+            return;
+        }
 
-        // --- Block 1: Verify User Licenses (WHMCS) ---
+        const cycleId = Date.now();
+        this.isRunning = true;
+        
+        try {
+            this.log('info', 'Starting verification cycle', { cycleId });
+            const startTime = Date.now();
+
+            // Run verification tasks in sequence
+            await this.verifyUserLicenses(cycleId);
+            await this.verifyWebsiteLicenses(cycleId);
+
+            const duration = Date.now() - startTime;
+            this.log('info', 'Verification cycle completed', { 
+                cycleId, 
+                duration: `${duration}ms` 
+            });
+            
+        } catch (error) {
+            this.log('error', 'Verification cycle failed', { 
+                cycleId, 
+                error: error.message,
+                stack: error.stack 
+            });
+        } finally {
+            this.isRunning = false;
+        }
+    }
+
+    /**
+     * Verify user licenses with WHMCS
+     */
+    async verifyUserLicenses(cycleId) {
         try {
             const [usersToCheck] = await pool.query(
                 `SELECT u.id, u.license_key, u.license_status, w.url AS websiteUrl 
                  FROM users u
                  LEFT JOIN websites w ON u.website_id = w.id
-                 WHERE u.license_status IN ('active', 'suspended', 'expired', 'reissued', 'inactive', 'invalid')`
+                 WHERE u.license_status IN ('active', 'suspended', 'expired', 'reissued', 'inactive', 'invalid')
+                 AND u.license_key IS NOT NULL
+                 AND u.license_key != ''`
             );
 
-            if (usersToCheck.length > 0) {
-                console.log(`[WORKER] Verifying ${usersToCheck.length} user licenses...`);
-                for (const user of usersToCheck) {
-                    if (!user.websiteUrl) continue;
-                    const hostname = new url.URL(user.websiteUrl).hostname;
-                    let resolvedIp = '';
+            this.log('info', 'Processing user licenses', { 
+                cycleId, 
+                count: usersToCheck.length 
+            });
+
+            let updatedCount = 0;
+            let errorCount = 0;
+
+            // Process in batches to avoid overwhelming the API
+            for (let i = 0; i < usersToCheck.length; i += this.batchSize) {
+                const batch = usersToCheck.slice(i, i + this.batchSize);
+                
+                for (const user of batch) {
                     try {
-                        const { address } = await dns.lookup(hostname);
-                        resolvedIp = address;
-                    } catch (dnsError) {
-                        console.warn(`[WORKER] Could not resolve IP for ${hostname} during check.`);
-                    }
-                    const result = await licenseService.checkUserLicense(user.license_key, { domain: hostname, ip: resolvedIp });
-                    let newRemoteStatus = result.status.toLowerCase();
-                    if (newRemoteStatus === 'reissued') newRemoteStatus = 'active';
-                    if (newRemoteStatus !== user.license_status) {
-                        console.log(`[WORKER] User license status changing for user ${user.id}: ${user.license_status} -> ${newRemoteStatus}`);
-                        await pool.query("UPDATE users SET license_status = ? WHERE id = ?", [newRemoteStatus, user.id]);
+                        if (!user.websiteUrl) {
+                            this.log('debug', 'Skipping user - no website URL', { 
+                                userId: user.id 
+                            });
+                            continue;
+                        }
+
+                        const hostname = this.extractHostname(user.websiteUrl);
+                        const resolvedIp = await this.resolveDomainIp(hostname);
+
+                        this.log('debug', 'Checking user license', { 
+                            userId: user.id,
+                            currentStatus: user.license_status
+                        });
+
+                        const result = await this.licenseService.checkUserLicense(
+                            user.license_key, 
+                            { domain: hostname, ip: resolvedIp }
+                        );
+
+                        if (result.status !== user.license_status) {
+                            await pool.execute(
+                                "UPDATE users SET license_status = ?, updated_at = NOW() WHERE id = ?",
+                                [result.status, user.id]
+                            );
+                            
+                            updatedCount++;
+                            this.log('info', 'User license status updated', {
+                                userId: user.id,
+                                oldStatus: user.license_status,
+                                newStatus: result.status,
+                                cycleId
+                            });
+                        }
+                    } catch (userError) {
+                        errorCount++;
+                        this.log('error', 'User license check failed', {
+                            userId: user.id,
+                            error: userError.message,
+                            cycleId
+                        });
                     }
                 }
-            }
-        } catch (error) {
-            console.error('[WORKER] Error during user license verification cycle:', error);
-        }
 
-        // --- Block 2: Verify Website Licenses (License Box) ---
+                // Small delay between batches to avoid rate limiting
+                if (i + this.batchSize < usersToCheck.length) {
+                    await this.delay(1000);
+                }
+            }
+
+            this.log('info', 'User license verification completed', {
+                cycleId,
+                processed: usersToCheck.length,
+                updated: updatedCount,
+                errors: errorCount
+            });
+
+        } catch (error) {
+            this.log('error', 'User license verification failed', {
+                cycleId,
+                error: error.message
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * Verify website licenses with License Box
+     */
+    async verifyWebsiteLicenses(cycleId) {
         try {
             const [websitesToCheck] = await pool.query(
-                "SELECT id, url, status, website_license_key, client_name FROM websites WHERE status IN ('approved', 'suspended')"
+                `SELECT id, url, status, website_license_key, client_name 
+                 FROM websites 
+                 WHERE status IN ('approved', 'suspended')
+                 AND website_license_key IS NOT NULL
+                 AND website_license_key != ''`
             );
-            if (websitesToCheck.length > 0) {
-                console.log(`[WORKER] Verifying ${websitesToCheck.length} website licenses...`);
-                for (const website of websitesToCheck) {
-                    if (!website.website_license_key) continue;
-                    const result = await licenseService.checkWebsiteLicense(website.website_license_key, { websiteUrl: website.url, clientName: website.client_name });
-                    const newRemoteStatus = result.isValid ? 'approved' : 'suspended';
-                    if (newRemoteStatus !== website.status) {
-                         console.log(`[WORKER] Website license status changing for website ${website.id}: ${website.status} -> ${newRemoteStatus}`);
-                         await pool.query("UPDATE websites SET status = ? WHERE id = ?", [newRemoteStatus, website.id]);
-                    }
-                }
-            }
-        } catch (error) {
-            console.error('[WORKER] Error during website license verification cycle:', error);
-        }
-        
-        // --- NEW Block 3: Synchronize Website Price Lists ---
-        try {
-            const [approvedWebsites] = await pool.query("SELECT id, url, website_license_key FROM websites WHERE status = 'approved'");
-            if (approvedWebsites.length > 0) {
-                console.log(`[WORKER] Synchronizing price lists for ${approvedWebsites.length} websites...`);
-                for (const website of approvedWebsites) {
-                    try {
-                        const pricesUrl = `${website.url}/api/prices/full-list`;
-                        const headers = { 'X-Website-License': website.website_license_key };
-                        const response = await axios.get(pricesUrl, { headers, timeout: 15000 });
-                        
-                        if (response.data && Array.isArray(response.data)) {
-                            // Use an efficient "UPSERT" query to update or insert prices into our cache table
-                            for (const item of response.data) {
-                                if (item.service_key && item.price) {
-                                    await pool.query(
-                                        `INSERT INTO website_prices (website_id, service_key, price)
-                                         VALUES (?, ?, ?)
-                                         ON DUPLICATE KEY UPDATE price = VALUES(price)`,
-                                        [website.id, item.service_key, item.price]
-                                    );
-                                }
-                            }
+
+            this.log('info', 'Processing website licenses', {
+                cycleId,
+                count: websitesToCheck.length
+            });
+
+            let updatedCount = 0;
+            let errorCount = 0;
+
+            for (const website of websitesToCheck) {
+                try {
+                    this.log('debug', 'Checking website license', {
+                        websiteId: website.id,
+                        currentStatus: website.status
+                    });
+
+                    const result = await this.licenseService.checkWebsiteLicense(
+                        website.website_license_key,
+                        { 
+                            websiteUrl: website.url, 
+                            clientName: website.client_name 
                         }
-                    } catch (priceError) {
-                        console.error(`[WORKER] Failed to sync prices for website ID ${website.id}: ${priceError.message}`);
+                    );
+
+                    const newStatus = result.isValid ? 'approved' : 'suspended';
+
+                    if (newStatus !== website.status) {
+                        await pool.execute(
+                            "UPDATE websites SET status = ?, updated_at = NOW() WHERE id = ?",
+                            [newStatus, website.id]
+                        );
+                        
+                        updatedCount++;
+                        this.log('info', 'Website license status updated', {
+                            websiteId: website.id,
+                            oldStatus: website.status,
+                            newStatus: newStatus,
+                            cycleId
+                        });
                     }
+                } catch (websiteError) {
+                    errorCount++;
+                    this.log('error', 'Website license check failed', {
+                        websiteId: website.id,
+                        error: websiteError.message,
+                        cycleId
+                    });
                 }
             }
+
+            this.log('info', 'Website license verification completed', {
+                cycleId,
+                processed: websitesToCheck.length,
+                updated: updatedCount,
+                errors: errorCount
+            });
+
         } catch (error) {
-            console.error('[WORKER] Error during price list synchronization:', error);
+            this.log('error', 'Website license verification failed', {
+                cycleId,
+                error: error.message
+            });
+            throw error;
         }
-        
-        console.log('[WORKER] Verification cycle finished.');
     }
-};
 
-module.exports = verifier;
+    // Helper methods
+    extractHostname(urlString) {
+        try {
+            // Handle URLs with protocol
+            if (urlString.includes('://')) {
+                const parsedUrl = new URL(urlString);
+                return parsedUrl.hostname;
+            }
+            // Handle bare domains
+            return urlString;
+        } catch (error) {
+            this.log('warn', 'Failed to parse URL', {
+                url: urlString,
+                error: error.message
+            });
+            return urlString;
+        }
+    }
 
+    async resolveDomainIp(domain) {
+        if (!domain) return '';
+
+        try {
+            const { address } = await dns.lookup(domain);
+            return address;
+        } catch (dnsError) {
+            this.log('warn', 'Domain IP resolution failed', {
+                domain,
+                error: dnsError.message
+            });
+            return '';
+        }
+    }
+
+    delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    log(level, message, meta = {}) {
+        const timestamp = new Date().toISOString();
+        const logEntry = {
+            timestamp,
+            level: level.toUpperCase(),
+            service: 'LicenseVerifier',
+            message,
+            ...meta
+        };
+
+        // JSON-structured logging for production
+        console.log(JSON.stringify(logEntry));
+    }
+
+    /**
+     * Manual trigger for verification cycle
+     */
+    async manualRun() {
+        this.log('info', 'Manual verification triggered');
+        await this.runVerificationCycle();
+    }
+
+    /**
+     * Get scheduler status
+     */
+    getStatus() {
+        return {
+            isRunning: this.isRunning,
+            isScheduled: this.cronJob !== null
+        };
+    }
+}
+
+// Create singleton instance
+const licenseVerifier = new LicenseVerifier();
+
+module.exports = licenseVerifier;

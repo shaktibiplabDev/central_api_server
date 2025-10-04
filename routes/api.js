@@ -798,4 +798,185 @@ router.get('/services/pricelist', authenticateToken, async (req, res) => {
     }
 });
 
+// Get deposit gateways and methods
+router.get('/deposit/gateways', authenticateToken, async (req, res) => {
+    try {
+        const user = req.user;
+        const [websites] = await pool.query("SELECT url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        
+        if (websites.length === 0) {
+            return res.status(404).json({ error: "Associated website not found for this user." });
+        }
+
+        const website = websites[0];
+        if (website.status !== 'approved') {
+            return res.status(403).json({ error: `Cannot fetch data: Website is currently ${website.status}.` });
+        }
+
+        const clientApiUrl = `${website.url}/api/deposit-gateways`;
+        
+        const response = await axios.get(clientApiUrl, {
+            headers: { 'X-Website-License': website.website_license_key },
+            timeout: 15000
+        });
+
+        res.json(response.data);
+
+    } catch (error) {
+        console.error(`Error fetching deposit gateways for user ${req.user.id}:`, error.message);
+        
+        if (error.response) {
+            return res.status(error.response.status).json({ 
+                error: 'An error occurred on the client website.', 
+                details: error.response.data 
+            });
+        }
+        
+        res.status(500).json({ error: 'Internal server error while fetching deposit gateways.' });
+    }
+});
+
+// Initiate deposit
+router.post('/deposit/initiate', authenticateToken, async (req, res) => {
+    try {
+        const user = req.user;
+        const { amount, customer_mobile, payment_method, remark1 } = req.body;
+
+        if (!amount || !customer_mobile) {
+            return res.status(400).json({ error: 'Amount and mobile number are required.' });
+        }
+
+        const [websites] = await pool.query("SELECT url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        
+        if (websites.length === 0) {
+            return res.status(404).json({ error: "Associated website not found for this user." });
+        }
+
+        const website = websites[0];
+        if (website.status !== 'approved') {
+            return res.status(403).json({ error: `Cannot process deposit: Website is currently ${website.status}.` });
+        }
+
+        const clientApiUrl = `${website.url}/api/deposit-initiate`;
+        
+        const response = await axios.post(clientApiUrl, {
+            email: user.email,
+            amount: parseFloat(amount),
+            customer_mobile: customer_mobile,
+            payment_method: payment_method || 'online',
+            remark1: remark1 || ''
+        }, {
+            headers: { 'X-Website-License': website.website_license_key },
+            timeout: 30000
+        });
+
+        res.json(response.data);
+
+    } catch (error) {
+        console.error(`Error initiating deposit for user ${req.user.id}:`, error.message);
+        
+        if (error.response) {
+            return res.status(error.response.status).json({ 
+                error: 'An error occurred on the client website.', 
+                details: error.response.data 
+            });
+        }
+        
+        if (error.code === 'ECONNABORTED') {
+            return res.status(408).json({ error: 'Request timeout - client website took too long to respond.' });
+        }
+        
+        res.status(500).json({ error: 'Internal server error while initiating deposit.' });
+    }
+});
+
+// Submit offline payment
+router.post('/deposit/offline', authenticateToken, async (req, res) => {
+    try {
+        const user = req.user;
+        const { amount, customer_mobile, transaction_id } = req.body;
+
+        if (!amount || !customer_mobile || !transaction_id) {
+            return res.status(400).json({ error: 'Amount, mobile number and transaction ID are required.' });
+        }
+
+        const [websites] = await pool.query("SELECT url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        
+        if (websites.length === 0) {
+            return res.status(404).json({ error: "Associated website not found for this user." });
+        }
+
+        const website = websites[0];
+        if (website.status !== 'approved') {
+            return res.status(403).json({ error: `Cannot process deposit: Website is currently ${website.status}.` });
+        }
+
+        const clientApiUrl = `${website.url}/api/deposit-offline`;
+        
+        const response = await axios.post(clientApiUrl, {
+            email: user.email,
+            amount: parseFloat(amount),
+            customer_mobile: customer_mobile,
+            transaction_id: transaction_id
+        }, {
+            headers: { 'X-Website-License': website.website_license_key },
+            timeout: 15000
+        });
+
+        res.json(response.data);
+
+    } catch (error) {
+        console.error(`Error submitting offline deposit for user ${req.user.id}:`, error.message);
+        
+        if (error.response) {
+            return res.status(error.response.status).json({ 
+                error: 'An error occurred on the client website.', 
+                details: error.response.data 
+            });
+        }
+        
+        res.status(500).json({ error: 'Internal server error while submitting offline deposit.' });
+    }
+});
+
+// Get deposit history
+router.get('/deposit/history', authenticateToken, async (req, res) => {
+    try {
+        const user = req.user;
+        const limit = req.query.limit || 10;
+
+        const [websites] = await pool.query("SELECT url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [user.id]);
+        
+        if (websites.length === 0) {
+            return res.status(404).json({ error: "Associated website not found for this user." });
+        }
+
+        const website = websites[0];
+        if (website.status !== 'approved') {
+            return res.status(403).json({ error: `Cannot fetch data: Website is currently ${website.status}.` });
+        }
+
+        const clientApiUrl = `${website.url}/api/deposit-history?email=${encodeURIComponent(user.email)}&limit=${limit}`;
+        
+        const response = await axios.get(clientApiUrl, {
+            headers: { 'X-Website-License': website.website_license_key },
+            timeout: 15000
+        });
+
+        res.json(response.data);
+
+    } catch (error) {
+        console.error(`Error fetching deposit history for user ${req.user.id}:`, error.message);
+        
+        if (error.response) {
+            return res.status(error.response.status).json({ 
+                error: 'An error occurred on the client website.', 
+                details: error.response.data 
+            });
+        }
+        
+        res.status(500).json({ error: 'Internal server error while fetching deposit history.' });
+    }
+});
+
 module.exports = router;
