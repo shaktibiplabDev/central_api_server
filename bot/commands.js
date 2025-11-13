@@ -501,16 +501,19 @@ async function renderInvoicePNG(invoice, payments = [], user = null) {
 }
 
 // -------------------------
-// Helper: buildUsersPagePayload
+// Helper: buildUsersPagePayload (Updated)
 // -------------------------
 async function buildUsersPagePayload(page = 1, per_page = 10) {
     try {
         const safePer = Math.min(50, Math.max(1, per_page));
+        
+        // Get total count
         const [[{ total }]] = await pool.query('SELECT COUNT(*) AS total FROM users');
         const totalPages = Math.max(1, Math.ceil(total / safePer));
         const currentPage = Math.min(Math.max(1, page), totalPages);
         const offset = (currentPage - 1) * safePer;
 
+        // Get users with proper error handling
         const [users] = await pool.query(
             `SELECT u.id, u.email, u.license_status, u.subscription_until, w.url as website_url
              FROM users u
@@ -522,19 +525,24 @@ async function buildUsersPagePayload(page = 1, per_page = 10) {
 
         const embed = new EmbedBuilder()
             .setTitle(`👥 Registered Users — page ${currentPage}/${totalPages}`)
-            .setColor(0x5865F2);
+            .setColor(0x5865F2)
+            .setTimestamp();
 
         const description = users.map(u => {
             const subUntil = u.subscription_until ? new Date(u.subscription_until).toISOString().split('T')[0] : 'N/A';
-            return `**ID ${u.id}**: \`${u.email}\` — **License:** ${u.license_status} — *Website:* ${u.website_url || 'N/A'} — *Sub:* ${subUntil}`;
+            const statusEmoji = u.license_status === 'active' ? '✅' : u.license_status === 'suspended' ? '❌' : '⚠️';
+            return `${statusEmoji} **ID ${u.id}**: \`${u.email}\` — **License:** ${u.license_status} — *Website:* ${u.website_url || 'N/A'} — *Sub:* ${subUntil}`;
         }).join('\n\n');
 
         embed.setDescription(description || 'No users on this page.');
-        embed.setFooter({ text: `Showing ${users.length} of ${total} users • per_page=${safePer}` });
+        embed.setFooter({ 
+            text: `Page ${currentPage}/${totalPages} • Showing ${users.length} of ${total} users • ${safePer} per page` 
+        });
 
+        // Create pagination buttons
         const prevButton = new ButtonBuilder()
             .setCustomId(`users_pagination|${currentPage - 1}|${safePer}`)
-            .setLabel('◀ Prev')
+            .setLabel('◀ Previous')
             .setStyle(ButtonStyle.Primary)
             .setDisabled(currentPage <= 1);
 
@@ -544,26 +552,36 @@ async function buildUsersPagePayload(page = 1, per_page = 10) {
             .setStyle(ButtonStyle.Primary)
             .setDisabled(currentPage >= totalPages);
 
+        // Create page indicator (non-interactive)
+        const pageIndicator = new ButtonBuilder()
+            .setCustomId('page_indicator')
+            .setLabel(`Page ${currentPage}/${totalPages}`)
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true);
+
         const perPageMenu = new StringSelectMenuBuilder()
             .setCustomId(`users_perpage|${currentPage}`)
-            .setPlaceholder(`Per page: ${safePer}`)
+            .setPlaceholder(`Results per page: ${safePer}`)
             .addOptions([
-                { label: '5 per page', value: '5' },
-                { label: '10 per page', value: '10' },
-                { label: '25 per page', value: '25' },
-                { label: '50 per page', value: '50' },
+                { label: '5 per page', value: '5', description: 'Show 5 users per page' },
+                { label: '10 per page', value: '10', description: 'Show 10 users per page' },
+                { label: '25 per page', value: '25', description: 'Show 25 users per page' },
+                { label: '50 per page', value: '50', description: 'Show 50 users per page' },
             ]);
 
-        const row1 = new ActionRowBuilder().addComponents(prevButton, nextButton);
+        const row1 = new ActionRowBuilder().addComponents(prevButton, pageIndicator, nextButton);
         const row2 = new ActionRowBuilder().addComponents(perPageMenu);
 
-        return { embeds: [embed], components: [row1, row2] };
+        return { 
+            embeds: [embed], 
+            components: [row1, row2],
+            flags: MessageFlags.Ephemeral
+        };
     } catch (error) {
         console.error('Error building users page payload:', error);
-        throw new Error('Failed to build users page');
+        throw new Error(`Failed to build users page: ${error.message}`);
     }
 }
-
 // -------------------------
 // Command handlers
 // -------------------------
@@ -706,11 +724,10 @@ handlers['list.users'] = async (interaction) => {
         const perPageRequested = interaction.options.getInteger('per_page') || 10;
         const per_page = Math.min(50, Math.max(1, perPageRequested));
         
+        console.log(`Initial users list: Page ${page}, Per Page: ${per_page}`);
+        
         const payload = await buildUsersPagePayload(page, per_page);
-        await interaction.reply({ 
-            ...payload, 
-            flags: [MessageFlags.Ephemeral] 
-        });
+        await interaction.reply(payload);
     } catch (error) {
         console.error('Error in list.users:', error);
         await interaction.reply({ 
@@ -1137,77 +1154,88 @@ handlers['invoice.print'] = async (interaction) => {
     }
 };
 
+
 // -------------------------
-// Component interaction handler
+// Component interaction handler (Updated)
 // -------------------------
 async function handleComponentInteraction(interaction) {
     try {
-        if (!(interaction.isButton() || interaction.isStringSelectMenu())) return false;
+        if (!(interaction.isButton() || interaction.isStringSelectMenu())) {
+            return false;
+        }
 
         // Security: check admin
         if (!await isAdmin(interaction)) {
-            if (!interaction.replied) {
-                await interaction.reply({ 
-                    content: '❌ You are not allowed to run this.', 
-                    ephemeral: true 
-                });
-            }
+            await interaction.reply({ 
+                content: '❌ You do not have permission to use this command.', 
+                ephemeral: true 
+            });
             return true;
         }
 
+        // Always defer update first for component interactions
+        await interaction.deferUpdate();
+
         // BUTTON: customId format => users_pagination|<page>|<per_page>
         if (interaction.isButton() && interaction.customId.startsWith('users_pagination|')) {
-            await interaction.deferUpdate();
             const [, pageStr, perPageStr] = interaction.customId.split('|');
             const page = parseInt(pageStr, 10) || 1;
             const per_page = Math.min(50, Math.max(1, parseInt(perPageStr, 10) || 10));
-            const payload = await buildUsersPagePayload(page, per_page);
+            
+            console.log(`Pagination: Page ${page}, Per Page: ${per_page}`);
             
             try {
+                const payload = await buildUsersPagePayload(page, per_page);
                 await interaction.editReply(payload);
-            } catch (err) {
-                // Fallback: try edit the underlying message if possible
-                try { 
-                    await interaction.message.edit(payload); 
-                } catch (e) { 
-                    console.error('Failed to edit message', e); 
-                }
+            } catch (error) {
+                console.error('Error handling pagination:', error);
+                await interaction.followUp({
+                    content: '❌ Failed to load page. Please try again.',
+                    ephemeral: true
+                });
             }
             return true;
         }
 
         // SELECT: customId format => users_perpage|<currentPage>
         if (interaction.isStringSelectMenu() && interaction.customId.startsWith('users_perpage|')) {
-            await interaction.deferUpdate();
             const [, currentPageStr] = interaction.customId.split('|');
             const selectedPerPage = parseInt(interaction.values[0], 10) || 10;
             const currentPage = parseInt(currentPageStr, 10) || 1;
-            const payload = await buildUsersPagePayload(currentPage, selectedPerPage);
+            
+            console.log(`Per page change: Page ${currentPage}, New per page: ${selectedPerPage}`);
             
             try {
+                const payload = await buildUsersPagePayload(currentPage, selectedPerPage);
                 await interaction.editReply(payload);
-            } catch (err) {
-                try { 
-                    await interaction.message.edit(payload); 
-                } catch (e) { 
-                    console.error('Failed to edit message', e); 
-                }
+            } catch (error) {
+                console.error('Error handling per page change:', error);
+                await interaction.followUp({
+                    content: '❌ Failed to change page size. Please try again.',
+                    ephemeral: true
+                });
             }
             return true;
         }
 
         return false;
     } catch (error) {
-        console.error('handleComponentInteraction error', error);
+        console.error('handleComponentInteraction error:', error);
+        
         try {
-            if (!interaction.replied) {
-                await interaction.reply({ 
-                    content: '❌ Error processing component interaction.', 
-                    ephemeral: true 
+            if (interaction.deferred) {
+                await interaction.followUp({
+                    content: '❌ Error processing your request. Please try again.',
+                    ephemeral: true
+                });
+            } else {
+                await interaction.reply({
+                    content: '❌ Error processing your request. Please try again.',
+                    ephemeral: true
                 });
             }
-        } catch (e) { 
-            console.error('Failed to send error response', e);
+        } catch (e) {
+            console.error('Failed to send error response:', e);
         }
         return true;
     }

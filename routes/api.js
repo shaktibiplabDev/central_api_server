@@ -489,7 +489,7 @@ router.post('/register', async (req, res) => {
 
     // 5) create invoice for initial 1-month subscription
     const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
-    const amount = parseFloat(process.env.INITIAL_SUBSCRIPTION_AMOUNT || '1.00'); // set in .env
+    const amount = parseFloat(process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00'); // set in .env
     const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, pending_user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
       invoiceNo, pendingUserId, amount, 'initial', 'pending'
     ]);
@@ -625,7 +625,7 @@ router.post('/login', async (req, res) => {
     if (currentLicenseStatus !== 'active') {
       try {
         const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
-        const amount = parseFloat(process.env.RENEWAL_AMOUNT || process.env.INITIAL_SUBSCRIPTION_AMOUNT || '1.00');
+        const amount = parseFloat(process.env.RENEWAL_AMOUNT || process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00');
 
         const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
           invoiceNo, user.id, amount, 'renewal', 'pending'
