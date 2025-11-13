@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const url = require('url');
+const subscriptionRoutes = require('./subscriptions');
 
 // Import local modules
 const { pool } = require('../config/database');
@@ -425,87 +426,283 @@ function authenticateToken(req, res, next) {
 }
 
 // --- Authentication Routes ---
+// POST /register
 router.post('/register', async (req, res) => {
-    try {
-        const { email, password, userLicenseKey, websiteUrl } = req.body;
-        if (!email || !password || !userLicenseKey || !websiteUrl) return res.status(400).json({ error: 'All fields are required.' });
-
-        const hostname = new url.URL(websiteUrl).hostname;
-        const userLicenseResult = await checkUserLicense(userLicenseKey, { domain: hostname });
-        if (userLicenseResult.status !== 'active') return res.status(400).json({ error: 'Your personal user license is not active.' });
-
-        let websiteLicenseKey, clientName;
-        try {
-            const licenseResponse = await axios.get(`${websiteUrl}/api/verify-license`, { timeout: 10000 });
-            websiteLicenseKey = licenseResponse.data.licenseKey;
-            clientName = licenseResponse.data.clientName;
-            if (!websiteLicenseKey || !clientName) throw new Error("Website did not return valid license details.");
-            await axios.post(`${websiteUrl}/api/verify-credentials`, { email, password }, { timeout: 10000 });
-        } catch (error) {
-            if (error.config && error.config.url.includes('verify-credentials')) return res.status(401).json({ error: 'Invalid credentials for the specified website.' });
-            return res.status(400).json({ error: 'Could not verify the provided website URL.' });
-        }
-
-        const licenseBoxResult = await checkWebsiteLicense(websiteLicenseKey, { websiteUrl, clientName });
-        const nameserverResult = await checkNameservers(websiteUrl);
-
-        let finalWebsiteStatus = 'pending';
-        let approvalMessage = `Website \`${websiteUrl}\` is pending. Reason:`;
-        if (licenseBoxResult.isValid && nameserverResult.isVerified) {
-            finalWebsiteStatus = 'approved';
-            approvalMessage = `Website \`${websiteUrl}\` was automatically approved.`;
-        } else {
-            if (!licenseBoxResult.isValid) approvalMessage += `\n- License Box: ${licenseBoxResult.message}`;
-            if (!nameserverResult.isVerified) approvalMessage += `\n- Nameserver: ${nameserverResult.message}`;
-        }
-
-        let [websites] = await pool.query('SELECT id FROM websites WHERE url = ?', [websiteUrl]);
-        let websiteId;
-        if (websites.length > 0) {
-            websiteId = websites[0].id;
-            await pool.query("UPDATE websites SET status = ?, website_license_key = ?, client_name = ? WHERE id = ?", [finalWebsiteStatus, websiteLicenseKey, clientName, websiteId]);
-        } else {
-            const [newWebsite] = await pool.query("INSERT INTO websites (url, status, website_license_key, client_name) VALUES (?, ?, ?, ?)", [websiteUrl, finalWebsiteStatus, websiteLicenseKey, clientName]);
-            websiteId = newWebsite.insertId;
-        }
-        const passwordHash = await bcrypt.hash(password, 12);
-        const [userResult] = await pool.query('INSERT INTO users (email, password_hash, license_key, license_status, website_id) VALUES (?, ?, ?, ?, ?)', [email, passwordHash, userLicenseKey, 'active', websiteId]);
-
-        await sendNotification(`🚀 **New User Registration**\n👤 Email: ${email}\n${approvalMessage}`, true);
-        res.status(201).json({ message: 'Registration successful.', userId: userResult.insertId, websiteStatus: finalWebsiteStatus });
-    } catch (error) {
-        if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'A user with this email or license key already exists.' });
-        console.error('Registration error:', error);
-        res.status(500).json({ error: 'Internal server error during registration.' });
+  try {
+    const { email, password, websiteUrl, phone } = req.body;
+    if (!email || !password || !websiteUrl) {
+      return res.status(400).json({ error: 'All fields are required.' });
     }
+
+    // 1) validate website URL and license at the remote site
+    let websiteLicenseKey, clientName;
+    try {
+      const licenseResponse = await axios.get(`${websiteUrl}/api/verify-license`, { timeout: 10000 });
+      websiteLicenseKey = licenseResponse.data.licenseKey;
+      clientName = licenseResponse.data.clientName;
+      if (!websiteLicenseKey || !clientName) throw new Error("Website did not return valid license details.");
+      await axios.post(`${websiteUrl}/api/verify-credentials`, { email, password }, { timeout: 10000 });
+    } catch (error) {
+      if (error.config && error.config.url && error.config.url.includes('verify-credentials')) {
+        return res.status(401).json({ error: 'Invalid credentials for the specified website.' });
+      }
+      return res.status(400).json({ error: 'Could not verify the provided website URL.' });
+    }
+
+    // 2) check with License Box for website (existing behaviour)
+    const licenseBoxResult = await checkWebsiteLicense(websiteLicenseKey, { websiteUrl, clientName });
+    const nameserverResult = await checkNameservers(websiteUrl);
+
+    let finalWebsiteStatus = 'pending';
+    let approvalMessage = `Website \`${websiteUrl}\` is pending. Reason:`;
+    if (licenseBoxResult.isValid && nameserverResult.isVerified) {
+      finalWebsiteStatus = 'approved';
+      approvalMessage = `Website \`${websiteUrl}\` was automatically approved.`;
+    } else {
+      if (!licenseBoxResult.isValid) approvalMessage += `\n- License Box: ${licenseBoxResult.message}`;
+      if (!nameserverResult.isVerified) approvalMessage += `\n- Nameserver: ${nameserverResult.message}`;
+    }
+
+    // 3) create or update website row
+    let [websites] = await pool.query('SELECT id FROM websites WHERE url = ?', [websiteUrl]);
+    let websiteId;
+    if (websites.length > 0) {
+      websiteId = websites[0].id;
+      await pool.query("UPDATE websites SET status = ?, website_license_key = ?, client_name = ? WHERE id = ?", [finalWebsiteStatus, websiteLicenseKey, clientName, websiteId]);
+    } else {
+      const [newWebsite] = await pool.query("INSERT INTO websites (url, status, website_license_key, client_name, created_at) VALUES (?, ?, ?, ?, NOW())", [websiteUrl, finalWebsiteStatus, websiteLicenseKey, clientName]);
+      websiteId = newWebsite.insertId;
+    }
+
+    // 4) create pending_user (we don't create active user until payment is done)
+    const passwordHash = await bcrypt.hash(password, 12);
+    const [pendingIns] = await pool.query('INSERT INTO pending_users (email, password_hash, phone, meta, created_at) VALUES (?, ?, ?, ?, NOW())', [
+      email,
+      passwordHash,
+      phone || null,
+      JSON.stringify({ 
+        origin: 'registration', 
+        website_id: websiteId,
+      })
+    ]);
+    const pendingUserId = pendingIns.insertId;
+
+    // 5) create invoice for initial 1-month subscription
+    const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
+    const amount = parseFloat(process.env.INITIAL_SUBSCRIPTION_AMOUNT || '1.00'); // set in .env
+    const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, pending_user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
+      invoiceNo, pendingUserId, amount, 'initial', 'pending'
+    ]);
+
+    // 6) create-order with provider and return payment_url
+    const FRONTEND_BASE = process.env.SERVER_BASE_URL || 'https://app.yoursite.com';
+    const redirectUrl = `${FRONTEND_BASE.replace(/\/$/, '')}/api/subscription/redirect?invoice_no=${encodeURIComponent(invoiceNo)}`;
+
+    const { createOrder } = require('../services/chargeGateway');
+    const createResp = await createOrder({
+      amount,
+      customer_mobile: phone || '',
+      order_id: invoiceNo,
+      remark1: 'initial_subscription',
+      remark2: `pending_user:${pendingUserId}`,
+      redirect_url: redirectUrl
+    });
+
+    if (!createResp.ok) {
+      console.error('createOrder failed', createResp);
+      return res.status(502).json({ error: 'payment_provider_error', details: createResp.error });
+    }
+
+    const body = createResp.data;
+    if (!(body && body.status === true && body.result && body.result.payment_url)) {
+      console.error('createOrder returned unexpected', body);
+      return res.status(502).json({ error: 'payment_create_failed', message: body && body.message });
+    }
+
+    // store gateway_response and provider orderId
+    await pool.query('UPDATE invoices SET gateway_provider = ?, gateway_response = ?, paid_at = NULL WHERE id = ?', [
+      'charge_wamosync',
+      JSON.stringify(body),
+      invRes.insertId
+    ]);
+
+    // notify admin and return payment_url to client
+    await sendNotification(`🆕 New pending registration: ${email}\nWebsite: ${websiteUrl}\nInvoice: ${invoiceNo}`, true);
+
+    return res.status(201).json({
+      message: 'Registration created. Complete payment to activate your account.',
+      invoice_no: invoiceNo,
+      invoiceId: invRes.insertId,
+      payment_url: body.result.payment_url
+    });
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'A user with this email already exists.' });
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Internal server error during registration.' });
+  }
 });
 
+// POST /login
 router.post('/login', async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
-        const [users] = await pool.query(`SELECT u.id, u.email, u.password_hash, u.license_status, w.url AS websiteUrl FROM users u LEFT JOIN websites w ON u.website_id = w.id WHERE u.email = ?`, [email]);
-        if (users.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
-        const user = users[0];
-        if (!user.websiteUrl) return res.status(500).json({ error: 'User is not associated with a website.' });
-        try {
-            await axios.post(`${user.websiteUrl}/api/verify-credentials`, { email, password }, { timeout: 10000 });
-        } catch (error) {
-            return res.status(401).json({ error: 'Invalid credentials provided for the website.' });
-        }
-        const isLocalPasswordValid = await bcrypt.compare(password, user.password_hash);
-        if (!isLocalPasswordValid) {
-            const newPasswordHash = await bcrypt.hash(password, 12);
-            await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [newPasswordHash, user.id]);
-        }
-        if (user.license_status !== 'active') return res.status(403).json({ error: 'Account not active', details: `License status: ${user.license_status}` });
-        const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
-        res.json({ message: 'Login successful', token });
-    } catch (error) {
-        console.error('Login error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+    const [users] = await pool.query(
+      `SELECT u.id, u.email, u.password_hash, u.license_status, u.license_key, w.url AS websiteUrl, u.phone
+       FROM users u
+       LEFT JOIN websites w ON u.website_id = w.id
+       WHERE u.email = ?`,
+      [email]
+    );
+
+    if (users.length === 0) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        subscriptionNeeded: true,
+        licenseKey: null
+      });
     }
+
+    const user = users[0];
+
+    if (!user.websiteUrl) {
+      return res.status(500).json({
+        error: 'User is not associated with a website.',
+        subscriptionNeeded: true,
+        licenseKey: user.license_key || null
+      });
+    }
+
+    // 1) verify credentials with customer website
+    try {
+      await axios.post(`${user.websiteUrl}/api/verify-credentials`, { email, password }, { timeout: 10000 });
+    } catch {
+      return res.status(401).json({
+        error: 'Invalid credentials provided for the website.',
+        subscriptionNeeded: true,
+        licenseKey: user.license_key || null
+      });
+    }
+
+    // 2) sync local password hash if needed
+    const isLocalPasswordValid = await bcrypt.compare(password, user.password_hash);
+    if (!isLocalPasswordValid) {
+      const newPasswordHash = await bcrypt.hash(password, 12);
+      await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [newPasswordHash, user.id]);
+    }
+
+    // 3) check license/subscription status using licenseService (will use internal mode if enabled)
+    let currentLicenseStatus = user.license_status;
+    if (user.license_key) {
+      try {
+        const hostname = (() => {
+          try {
+            if (user.websiteUrl.includes('://')) return new URL(user.websiteUrl).hostname;
+            return user.websiteUrl;
+          } catch {
+            return user.websiteUrl;
+          }
+        })();
+
+        const result = await licenseService.checkUserLicense(user.license_key, { domain: hostname, userId: user.id });
+        const newStatus = result.status || 'invalid';
+
+        if (newStatus !== currentLicenseStatus) {
+          await pool.query(
+            'UPDATE users SET license_status = ?, updated_at = NOW() WHERE id = ?',
+            [newStatus, user.id]
+          );
+          currentLicenseStatus = newStatus;
+        }
+      } catch (licErr) {
+        console.error('License re-check error:', licErr?.message || licErr);
+        // keep existing status
+      }
+    }
+
+    // 4) If not active, create renewal invoice and return payment_url so client can pay immediately
+    if (currentLicenseStatus !== 'active') {
+      try {
+        const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
+        const amount = parseFloat(process.env.RENEWAL_AMOUNT || process.env.INITIAL_SUBSCRIPTION_AMOUNT || '1.00');
+
+        const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
+          invoiceNo, user.id, amount, 'renewal', 'pending'
+        ]);
+
+        const FRONTEND_BASE = process.env.SERVER_BASE_URL || 'https://app.yoursite.com';
+        const redirectUrl = `${FRONTEND_BASE.replace(/\/$/, '')}/api/subscription/redirect?invoice_no=${encodeURIComponent(invoiceNo)}`;
+
+        const { createOrder } = require('../services/chargeGateway');
+        const createResp = await createOrder({
+          amount,
+          customer_mobile: user.phone || '',
+          order_id: invoiceNo,
+          remark1: 'renewal',
+          remark2: `user:${user.id}`,
+          redirect_url: redirectUrl
+        });
+
+        if (!createResp.ok) {
+          console.error('createOrder failed for renewal', createResp);
+          return res.status(502).json({ error: 'payment_provider_error', details: createResp.error });
+        }
+
+        const body = createResp.data;
+        if (!(body && body.status === true && body.result && body.result.payment_url)) {
+          console.error('createOrder returned unexpected for renewal', body);
+          return res.status(502).json({ error: 'payment_create_failed', message: body && body.message });
+        }
+
+        // persist gateway response
+        await pool.query('UPDATE invoices SET gateway_provider = ?, gateway_response = ? WHERE id = ?', [
+          'charge_wamosync',
+          JSON.stringify(body),
+          invRes.insertId
+        ]);
+
+        // return response indicating payment required + payment url
+        return res.status(403).json({
+          error: 'Subscription required',
+          message: 'Your subscription is not active. Please complete payment to renew.',
+          subscriptionNeeded: true,
+          licenseStatus: currentLicenseStatus,
+          invoice_no: invoiceNo,
+          invoiceId: invRes.insertId,
+          payment_url: body.result.payment_url
+        });
+      } catch (invoiceErr) {
+        console.error('Failed to create renewal invoice', invoiceErr);
+        return res.status(500).json({ error: 'Failed to create renewal invoice', subscriptionNeeded: true });
+      }
+    }
+
+    // 5) everything good -> issue JWT and include license info
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    return res.json({
+      message: 'Login successful',
+      token,
+      licenseKey: user.license_key || null,
+      licenseStatus: currentLicenseStatus,
+      subscriptionNeeded: false
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    return res.status(500).json({
+      error: 'Internal server error',
+      subscriptionNeeded: true
+    });
+  }
 });
+
+
 
 // Secure App Upload Endpoint (Postman/API method)
 router.post('/app-upload', upload.single('apkfile'), async (req, res) => {
@@ -889,6 +1086,8 @@ router.post('/deposit/initiate', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Internal server error while initiating deposit.' });
     }
 });
+
+router.use('/subscription', subscriptionRoutes);
 
 // Submit offline payment
 router.post('/deposit/offline', authenticateToken, async (req, res) => {

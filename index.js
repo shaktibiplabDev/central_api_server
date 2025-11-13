@@ -143,7 +143,6 @@ class ApplicationServer {
                 timestamp: new Date().toISOString()
             });
             
-            // In production, we might want to exit and let process manager restart
             if (process.env.NODE_ENV === 'production') {
                 process.exit(1);
             }
@@ -157,7 +156,6 @@ class ApplicationServer {
                 timestamp: new Date().toISOString()
             });
             
-            // In production, we might want to exit and let process manager restart
             if (process.env.NODE_ENV === 'production') {
                 process.exit(1);
             }
@@ -212,6 +210,21 @@ class ApplicationServer {
                     console.error(`❌ Service ${index} failed to start:`, failure.reason);
                 });
                 throw new Error(`${failures.length} service(s) failed to start`);
+            }
+
+            // 🧩 Internal subscription system integration
+            if (process.env.USE_INTERNAL_LICENSE === 'true') {
+                try {
+                    const { startOrderPoller } = require('./jobs/orderStatusPoller');
+                    const { startScheduler } = require('./jobs/licenseChecker');
+                    
+                    startOrderPoller();
+                    startScheduler();
+
+                    console.log('✅ Internal subscription jobs started (order poller & license scheduler).');
+                } catch (e) {
+                    console.error('⚠️ Failed to start internal subscription jobs', e);
+                }
             }
 
             console.log('--- ✅ Application is fully operational ---');

@@ -1,7 +1,9 @@
+// services/licenseService.js
 const axios = require('axios');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const url = require('url');
+const { pool } = require('../config/database'); // <-- DB pool (used for internal mode)
 
 class LicenseService {
     constructor() {
@@ -10,6 +12,9 @@ class LicenseService {
         this.licenseBoxApiUrl = process.env.LICENSE_BOX_API_URL;
         this.licenseBoxApiKey = process.env.LICENSE_BOX_API_KEY;
         this.licenseBoxProductId = process.env.LICENSE_BOX_PRODUCT_ID;
+
+        // internal-mode toggle
+        this.useInternal = (process.env.USE_INTERNAL_LICENSE === 'true');
         
         // Bind all methods to maintain 'this' context
         this.checkUserLicense = this.checkUserLicense.bind(this);
@@ -29,6 +34,12 @@ class LicenseService {
     }
 
     validateConfig() {
+        // If using internal license mode, we do not require WHMCS / License Box envs.
+        if (this.useInternal) {
+            this.log('info', 'USE_INTERNAL_LICENSE enabled — skipping external license config validation');
+            return;
+        }
+
         const requiredEnvVars = [
             'WHMCS_API_URL',
             'WHMCS_SECRET_KEY',
@@ -44,9 +55,11 @@ class LicenseService {
     }
 
     /**
-     * Verifies a USER license key against WHMCS.
-     * @param {string} licenseKey The user license key to validate.
-     * @param {object} [options={}] Optional data for the check.
+     * Verifies a USER license key.
+     * - If internal mode is enabled (USE_INTERNAL_LICENSE=true) we check local DB fields.
+     * - Otherwise, we call WHMCS (production) or mock in non-production.
+     * @param {string} licenseKey
+     * @param {object} [options={}]
      * @returns {Promise<{status: string, details: object}>}
      */
     async checkUserLicense(licenseKey, options = {}) {
@@ -55,15 +68,56 @@ class LicenseService {
             throw new Error('License key is required and must be a string');
         }
 
-        // Development mode check
+        // --- Internal mode short-circuit ---
+        if (this.useInternal) {
+            try {
+                // Try to find by license_key first, fallback to userId in options
+                const lookupKey = licenseKey || null;
+                const userId = options.userId || null;
+
+                // If both licenseKey and userId not provided, return invalid
+                if (!lookupKey && !userId) {
+                    return { status: 'invalid', details: { internal: true, message: 'Missing licenseKey and userId' } };
+                }
+
+                // Query DB: prefer license_key match then id
+                let rows;
+                if (lookupKey) {
+                    [rows] = await pool.query('SELECT id, license_key, license_status, subscription_until FROM users WHERE license_key = ? LIMIT 1', [lookupKey]);
+                }
+                if ((!rows || rows.length === 0) && userId) {
+                    [rows] = await pool.query('SELECT id, license_key, license_status, subscription_until FROM users WHERE id = ? LIMIT 1', [userId]);
+                }
+
+                if (!rows || rows.length === 0) {
+                    return { status: 'invalid', details: { internal: true, message: 'No matching user/license found' } };
+                }
+
+                const user = rows[0];
+                const now = new Date();
+                const until = user.subscription_until ? new Date(user.subscription_until) : null;
+
+                // Active if subscription_until in future
+                if (until && until > now) {
+                    return { status: 'active', details: { internal: true, subscription_until: user.subscription_until } };
+                }
+
+                // Otherwise suspended or inactive (report stored license_status)
+                return { status: user.license_status || 'suspended', details: { internal: true, subscription_until: user.subscription_until } };
+
+            } catch (err) {
+                this.log('error', 'Internal license check failed', { error: err.message });
+                return { status: 'error', details: { internal: true, message: err.message } };
+            }
+        }
+
+        // --- Non-internal mode: WHMCS / production flow ---
+        // Development mode shortcut (mock)
         if (process.env.NODE_ENV !== 'production') {
             this.log('warn', `Mocking WHMCS check for user license: ${licenseKey}`);
             return { 
                 status: 'active', 
-                details: { 
-                    message: 'Mock validation successful.', 
-                    mock: true 
-                } 
+                details: { message: 'Mock validation successful (non-production).', mock: true }
             };
         }
         
@@ -136,8 +190,8 @@ class LicenseService {
 
     /**
      * Verifies a WEBSITE license key against the License Box API.
-     * @param {string} licenseKey The website license key to validate.
-     * @param {object} [options={}] Optional data for the check.
+     * @param {string} licenseKey
+     * @param {object} [options={}]
      * @returns {Promise<{isValid: boolean, message: string}>}
      */
     async checkWebsiteLicense(licenseKey, options = {}) {
@@ -273,10 +327,7 @@ class LicenseService {
             const parsedUrl = new URL(urlString);
             return parsedUrl.hostname;
         } catch (error) {
-            this.log('warn', 'Failed to parse URL, treating as domain', { 
-                input, 
-                error: error.message 
-            });
+            this.log('warn', 'Failed to parse URL, treating as domain', { input, error: error.message });
             // If URL parsing fails, try to extract domain manually
             return input.replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0];
         }
@@ -312,10 +363,7 @@ class LicenseService {
         }
 
         const whmcsStatus = results.status.toLowerCase().trim();
-        this.log('debug', 'WHMCS status mapping', { 
-            rawStatus: results.status, 
-            normalizedStatus: whmcsStatus 
-        });
+        this.log('debug', 'WHMCS status mapping', { rawStatus: results.status, normalizedStatus: whmcsStatus });
 
         const statusMap = {
             'active': 'active',

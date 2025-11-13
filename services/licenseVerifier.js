@@ -1,3 +1,4 @@
+// jobs/licenseVerifier.js
 const { pool } = require('../config/database');
 const dns = require('dns').promises;
 const url = require('url');
@@ -9,7 +10,8 @@ class LicenseVerifier {
         this.isRunning = false;
         this.licenseService = require('./licenseService');
         this.batchSize = parseInt(process.env.LICENSE_BATCH_SIZE) || 50;
-        
+        this.useInternal = (process.env.USE_INTERNAL_LICENSE === 'true');
+
         this.validateDatabasePool();
     }
 
@@ -29,7 +31,7 @@ class LicenseVerifier {
             throw new Error(`Invalid cron schedule: ${schedule}`);
         }
 
-        this.log('info', 'Starting license verification scheduler', { schedule });
+        this.log('info', 'Starting license verification scheduler', { schedule, useInternal: this.useInternal });
         
         // Run immediately on startup with delay to allow app to fully initialize
         setTimeout(() => {
@@ -99,9 +101,16 @@ class LicenseVerifier {
     }
 
     /**
-     * Verify user licenses with WHMCS
+     * Verify user licenses.
+     * - If USE_INTERNAL_LICENSE=true, use subscription_until in users table as truth.
+     * - Otherwise, use existing WHMCS/licenseService checks.
      */
     async verifyUserLicenses(cycleId) {
+        if (this.useInternal) {
+            return this.verifyUserLicensesInternal(cycleId);
+        }
+
+        // original behaviour (external checks)
         try {
             const [usersToCheck] = await pool.query(
                 `SELECT u.id, u.license_key, u.license_status, w.url AS websiteUrl 
@@ -112,7 +121,7 @@ class LicenseVerifier {
                  AND u.license_key != ''`
             );
 
-            this.log('info', 'Processing user licenses', { 
+            this.log('info', 'Processing user licenses (external)', { 
                 cycleId, 
                 count: usersToCheck.length 
             });
@@ -127,16 +136,14 @@ class LicenseVerifier {
                 for (const user of batch) {
                     try {
                         if (!user.websiteUrl) {
-                            this.log('debug', 'Skipping user - no website URL', { 
-                                userId: user.id 
-                            });
+                            this.log('debug', 'Skipping user - no website URL', { userId: user.id });
                             continue;
                         }
 
                         const hostname = this.extractHostname(user.websiteUrl);
                         const resolvedIp = await this.resolveDomainIp(hostname);
 
-                        this.log('debug', 'Checking user license', { 
+                        this.log('debug', 'Checking user license (external)', { 
                             userId: user.id,
                             currentStatus: user.license_status
                         });
@@ -193,7 +200,86 @@ class LicenseVerifier {
     }
 
     /**
-     * Verify website licenses with License Box
+     * Internal mode: verify users by subscription_until and update license_status to active/suspended.
+     * This is a lightweight check — we don't call external services.
+     */
+    async verifyUserLicensesInternal(cycleId) {
+        try {
+            // select all users with a license_key (or who have subscription_until defined)
+            const [usersToCheck] = await pool.query(
+                `SELECT id, email, license_key, license_status, subscription_until
+                 FROM users
+                 WHERE (license_key IS NOT NULL AND license_key != '') OR subscription_until IS NOT NULL`
+            );
+
+            this.log('info', 'Processing user licenses (internal)', {
+                cycleId,
+                count: usersToCheck.length
+            });
+
+            let updatedCount = 0;
+            let errorCount = 0;
+
+            for (let i = 0; i < usersToCheck.length; i += this.batchSize) {
+                const batch = usersToCheck.slice(i, i + this.batchSize);
+
+                for (const user of batch) {
+                    try {
+                        const now = new Date();
+                        const until = user.subscription_until ? new Date(user.subscription_until) : null;
+                        let desiredStatus = 'suspended';
+
+                        if (until && until > now) {
+                            desiredStatus = 'active';
+                        } else {
+                            // no subscription_until or already past -> suspended
+                            desiredStatus = 'suspended';
+                        }
+
+                        if (user.license_status !== desiredStatus) {
+                            await pool.execute(
+                                "UPDATE users SET license_status = ?, updated_at = NOW() WHERE id = ?",
+                                [desiredStatus, user.id]
+                            );
+
+                            updatedCount++;
+                            this.log('info', 'User license status updated (internal)', {
+                                userId: user.id,
+                                oldStatus: user.license_status,
+                                newStatus: desiredStatus,
+                                subscription_until: user.subscription_until,
+                                cycleId
+                            });
+                        }
+                    } catch (userError) {
+                        errorCount++;
+                        this.log('error', 'Internal user license check failed', {
+                            userId: user.id,
+                            error: userError.message,
+                            cycleId
+                        });
+                    }
+                }
+
+                if (i + this.batchSize < usersToCheck.length) {
+                    await this.delay(500); // shorter delay for internal checks
+                }
+            }
+
+            this.log('info', 'Internal user license verification completed', {
+                cycleId,
+                processed: usersToCheck.length,
+                updated: updatedCount,
+                errors: errorCount
+            });
+        } catch (err) {
+            this.log('error', 'Internal user license verification failed', { cycleId, error: err.message });
+            throw err;
+        }
+    }
+
+    /**
+     * Verify website licenses with License Box (unchanged)
      */
     async verifyWebsiteLicenses(cycleId) {
         try {
@@ -336,7 +422,8 @@ class LicenseVerifier {
     getStatus() {
         return {
             isRunning: this.isRunning,
-            isScheduled: this.cronJob !== null
+            isScheduled: this.cronJob !== null,
+            useInternal: this.useInternal
         };
     }
 }
