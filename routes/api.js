@@ -559,7 +559,7 @@ router.post('/login', async (req, res) => {
     if (users.length === 0) {
       return res.status(401).json({
         error: 'Invalid credentials',
-        subscriptionNeeded: true,
+        subscriptionNeeded: false,
         licenseKey: null
       });
     }
@@ -569,7 +569,7 @@ router.post('/login', async (req, res) => {
     if (!user.websiteUrl) {
       return res.status(500).json({
         error: 'User is not associated with a website.',
-        subscriptionNeeded: true,
+        subscriptionNeeded: false,
         licenseKey: user.license_key || null
       });
     }
@@ -580,7 +580,7 @@ router.post('/login', async (req, res) => {
     } catch {
       return res.status(401).json({
         error: 'Invalid credentials provided for the website.',
-        subscriptionNeeded: true,
+        subscriptionNeeded: false,
         licenseKey: user.license_key || null
       });
     }
