@@ -26,16 +26,24 @@ module.exports = {
             }
         }
 
+        // FIXED: Validate both photo fields
+        if (!data.applicant_photo || !data.applicant_photo_mime_type) {
+            return 'Applicant photograph and MIME type are required.';
+        }
+
         // Validate photo data
         if (data.applicant_photo) {
-            // Check if it's a valid base64 string
-            const base64Regex = /^data:image\/(jpeg|jpg|png);base64,[A-Za-z0-9+/]+={0,2}$/;
+            // Check if it's a valid base64 string (with or without data URI)
+            const base64Regex = /^(data:image\/(jpeg|jpg|png);base64,)?[A-Za-z0-9+/]+={0,2}$/;
             if (!base64Regex.test(data.applicant_photo)) {
                 return 'Invalid photograph format. Please upload a valid JPEG or PNG image.';
             }
             
             // Check file size (approx 2MB limit)
-            const base64Data = data.applicant_photo.split(',')[1];
+            let base64Data = data.applicant_photo;
+            if (data.applicant_photo.includes(';base64,')) {
+                base64Data = data.applicant_photo.split(',')[1];
+            }
             const fileSize = Buffer.from(base64Data, 'base64').length;
             if (fileSize > 2 * 1024 * 1024) {
                 return 'Photograph size must be less than 2MB.';
@@ -62,6 +70,10 @@ module.exports = {
     },
 
     process: async (data, user) => {
+        console.log('=== MOBILE EMAIL UPDATE PROCESSING STARTED ===');
+        console.log('User:', user.email);
+        console.log('Data keys:', Object.keys(data));
+
         const [websites] = await pool.query(
             "SELECT id, url, status, website_license_key FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)",
             [user.id]
@@ -74,37 +86,63 @@ module.exports = {
 
         let servicePrice;
         let userBalance;
+        
         try {
+            // FIXED: Enhanced price check with detailed logging
             const priceUrl = `${website.url}/api/service-price?service_key=mobile-email-update`;
+            console.log('Checking price at:', priceUrl);
+            
             const priceResponse = await axios.get(priceUrl, { headers, timeout: 10000 });
+            console.log('Price response:', priceResponse.data);
+            
             servicePrice = priceResponse.data.price;
+            console.log('Service price:', servicePrice);
 
+            // FIXED: Enhanced wallet check with detailed logging
             const walletUrl = `${website.url}/api/user/wallet?email=${encodeURIComponent(user.email)}`;
+            console.log('Checking wallet at:', walletUrl);
+            
             const walletResponse = await axios.get(walletUrl, { headers, timeout: 10000 });
+            console.log('Wallet response:', walletResponse.data);
+            
             userBalance = walletResponse.data.balance;
+            console.log('User balance:', userBalance);
 
             if (servicePrice === undefined || userBalance === undefined) {
+                console.log('ERROR: Price or balance is undefined');
                 throw new Error("Could not retrieve price or balance from the client website.");
             }
+
+            console.log('Balance check:', userBalance, '>=', servicePrice, '=', userBalance >= servicePrice);
+
         } catch (error) {
+            console.error('Price/Balance check error:', error.message);
+            if (error.response) {
+                console.error('Error response:', error.response.data);
+            }
             throw new Error('Could not verify price and balance with the client website.');
         }
 
         if (userBalance < servicePrice) {
-            const error = new Error(`Insufficient wallet balance. Required: ${servicePrice}, Available: ${userBalance}`);
+            console.log('INSUFFICIENT BALANCE: Required:', servicePrice, 'Available:', userBalance);
+            const error = new Error(`Insufficient wallet balance. Required: ₹${servicePrice}, Available: ₹${userBalance}`);
             error.statusCode = 402;
             throw error;
         }
 
-        // Process photograph data
-        let applicantPhoto = '';
-        let applicantPhotoMimeType = '';
-        if (data.applicant_photo) {
-            const photoParts = data.applicant_photo.split(';base64,');
+        // FIXED: Process photograph data - handle both formats
+        let applicantPhoto = data.applicant_photo || '';
+        let applicantPhotoMimeType = data.applicant_photo_mime_type || '';
+
+        console.log('Photo data present:', !!applicantPhoto);
+        console.log('MIME type present:', !!applicantPhotoMimeType);
+
+        // If photo has data URI prefix, extract just the base64 part
+        if (applicantPhoto.includes(';base64,')) {
+            const photoParts = applicantPhoto.split(';base64,');
             if (photoParts.length === 2) {
                 applicantPhoto = photoParts[1]; // Extract base64 data without prefix
-                const mimeType = photoParts[0].replace('data:', '');
-                applicantPhotoMimeType = mimeType;
+                console.log('Extracted base64 data from data URI');
             }
         }
 
@@ -129,16 +167,29 @@ module.exports = {
                 missing_fingers: data.missing_fingers || []
             }
         };
+
+        console.log('Sending data to client website...');
+        console.log('Processed data keys:', Object.keys(processedData.formData));
         
         let finalResponseData;
         try {
             const submitUrl = `${website.url}/api/forms/mobile-email-update`;
+            console.log('Submitting to:', submitUrl);
+            
             const response = await axios.post(submitUrl, processedData, { 
                 headers, 
                 timeout: 45000 
             });
+            
             finalResponseData = response.data;
+            console.log('Submission successful:', finalResponseData);
+
         } catch (error) {
+            console.error('Submission error:', error.message);
+            if (error.response) {
+                console.error('Error response status:', error.response.status);
+                console.error('Error response data:', error.response.data);
+            }
             const errorMessage = error.response ? 
                 (error.response.data.error || JSON.stringify(error.response.data)) : 
                 'Failed to submit form to the client website.';
@@ -158,6 +209,7 @@ module.exports = {
             }
         }
         
+        console.log('=== MOBILE EMAIL UPDATE PROCESSING COMPLETED ===');
         return finalResponseData;
     }
 };
