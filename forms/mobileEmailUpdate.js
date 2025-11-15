@@ -18,11 +18,27 @@ const validators = {
 
 module.exports = {
     validate: async (data, user) => {
-        const requiredFields = ['full_name', 'mobile_no', 'email_id', 'purpose', 'aadhar_no'];
+        const requiredFields = ['full_name', 'mobile_no', 'email_id', 'purpose', 'aadhar_no', 'applicant_photo'];
         
         for (const field of requiredFields) {
             if (!data[field] || String(data[field]).trim() === '') {
                 return `Field '${field}' is required and cannot be empty.`;
+            }
+        }
+
+        // Validate photo data
+        if (data.applicant_photo) {
+            // Check if it's a valid base64 string
+            const base64Regex = /^data:image\/(jpeg|jpg|png);base64,[A-Za-z0-9+/]+={0,2}$/;
+            if (!base64Regex.test(data.applicant_photo)) {
+                return 'Invalid photograph format. Please upload a valid JPEG or PNG image.';
+            }
+            
+            // Check file size (approx 2MB limit)
+            const base64Data = data.applicant_photo.split(',')[1];
+            const fileSize = Buffer.from(base64Data, 'base64').length;
+            if (fileSize > 2 * 1024 * 1024) {
+                return 'Photograph size must be less than 2MB.';
             }
         }
 
@@ -80,6 +96,18 @@ module.exports = {
             throw error;
         }
 
+        // Process photograph data
+        let applicantPhoto = '';
+        let applicantPhotoMimeType = '';
+        if (data.applicant_photo) {
+            const photoParts = data.applicant_photo.split(';base64,');
+            if (photoParts.length === 2) {
+                applicantPhoto = photoParts[1]; // Extract base64 data without prefix
+                const mimeType = photoParts[0].replace('data:', '');
+                applicantPhotoMimeType = mimeType;
+            }
+        }
+
         // FIXED: Send fingerprints as array and missing_fingers as array
         const processedData = {
             email: sanitizeText(user.email),
@@ -90,6 +118,8 @@ module.exports = {
                 purpose: sanitizeText(data.purpose),
                 aadhar_no: sanitizeText(data.aadhar_no),
                 father_name: sanitizeText(data.father_name || ''),
+                applicant_photo: applicantPhoto,
+                applicant_photo_mime_type: applicantPhotoMimeType,
                 // FIXED: Send as array, not object
                 fingerprints: data.fingerprints ? data.fingerprints.map(fp => ({
                     id: fp.id,
