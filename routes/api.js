@@ -104,11 +104,9 @@ const fieldMappings = {
             'email_id': 'email_id',
             'purpose': 'purpose',
             'aadhar_no': 'aadhar_no',
-            'father_name': 'father_name',
-            'applicant_photo': 'applicant_photo',
-            'applicant_photo_mime_type': 'applicant_photo_mime_type'
+            'father_name': 'father_name'
         },
-        files: {} // No file uploads for this form (photo is handled as base64)
+        files: {} // No file uploads for this form
     },
     'name-update': {
         fields: {
@@ -158,13 +156,6 @@ const enhancedValidators = {
             if (base64String.includes(';base64,')) {
                 const parts = base64String.split(';base64,');
                 if (parts.length !== 2) return false;
-                
-                // Check if it's an image MIME type
-                const mimeType = parts[0].replace('data:', '');
-                if (!mimeType.startsWith('image/')) {
-                    return false;
-                }
-                
                 return Buffer.from(parts[1], 'base64').length > 0;
             }
             return Buffer.from(base64String, 'base64').length > 0;
@@ -373,10 +364,6 @@ function validateFormData(formData, formType) {
             }
             if (formData.aadhar_no && !enhancedValidators.isValidAadhar(formData.aadhar_no)) {
                 errors.push('Aadhar number must be a valid 12-digit number.');
-            }
-            // Add photograph validation
-            if (formData.applicant_photo && !enhancedValidators.isValidBase64(formData.applicant_photo)) {
-                errors.push('Invalid photograph format. Please upload a valid JPEG or PNG image.');
             }
             break;
 
@@ -822,7 +809,6 @@ router.post('/forms/:formType', authenticateToken, upload.any(), async (req, res
         console.log('Fields received:', Object.keys(formData));
         console.log('Fingerprints present:', !!formData.fingerprints);
         console.log('Missing fingers present:', !!formData.missing_fingers);
-        console.log('Applicant photo present:', !!formData.applicant_photo);
 
         // Handle file uploads (non-fingerprint documents)
         if (req.files && req.files.length > 0) {
