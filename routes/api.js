@@ -447,16 +447,6 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'All fields are required.' });
     }
 
-    // Check if user already exists in users table (completed registration)
-    const [existingUsers] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
-    if (existingUsers.length > 0) {
-      return res.status(409).json({ error: 'A user with this email already exists.' });
-    }
-
-    // Check if user exists in pending_users (incomplete payment)
-    const [existingPending] = await pool.query('SELECT id FROM pending_users WHERE email = ?', [email]);
-    let pendingUserId = existingPending.length > 0 ? existingPending[0].id : null;
-
     // 1) validate website URL and license at the remote site
     let websiteLicenseKey, clientName;
     try {
@@ -497,36 +487,27 @@ router.post('/register', async (req, res) => {
       websiteId = newWebsite.insertId;
     }
 
-    // 4) Handle pending user - ALWAYS DELETE EXISTING PENDING INVOICES FIRST
+    // 4) create pending_user (we don't create active user until payment is done)
     const passwordHash = await bcrypt.hash(password, 12);
-    
-    if (pendingUserId) {
-      // Update existing pending user with new details
-      await pool.query(
-        'UPDATE pending_users SET password_hash = ?, phone = ?, meta = ?, created_at = NOW() WHERE id = ?',
-        [passwordHash, phone || null, JSON.stringify({ origin: 'registration', website_id: websiteId }), pendingUserId]
-      );
-    } else {
-      // Create new pending user
-      const [pendingIns] = await pool.query(
-        'INSERT INTO pending_users (email, password_hash, phone, meta, created_at) VALUES (?, ?, ?, ?, NOW())',
-        [email, passwordHash, phone || null, JSON.stringify({ origin: 'registration', website_id: websiteId })]
-      );
-      pendingUserId = pendingIns.insertId;
-    }
+    const [pendingIns] = await pool.query('INSERT INTO pending_users (email, password_hash, phone, meta, created_at) VALUES (?, ?, ?, ?, NOW())', [
+      email,
+      passwordHash,
+      phone || null,
+      JSON.stringify({ 
+        origin: 'registration', 
+        website_id: websiteId,
+      })
+    ]);
+    const pendingUserId = pendingIns.insertId;
 
-    // ALWAYS DELETE ANY EXISTING PENDING INVOICES FOR THIS USER
-    await pool.query('DELETE FROM invoices WHERE pending_user_id = ? AND status = "pending"', [pendingUserId]);
-
-    // 5) create NEW invoice for initial 1-month subscription
+    // 5) create invoice for initial 1-month subscription
     const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
-    const amount = parseFloat(process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00');
-    const [invRes] = await pool.query(
-      'INSERT INTO invoices (invoice_no, pending_user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-      [invoiceNo, pendingUserId, amount, 'initial', 'pending']
-    );
+    const amount = parseFloat(process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00'); // set in .env
+    const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, pending_user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
+      invoiceNo, pendingUserId, amount, 'initial', 'pending'
+    ]);
 
-    // 6) ALWAYS CREATE NEW ORDER with provider and return payment_url
+    // 6) create-order with provider and return payment_url
     const FRONTEND_BASE = process.env.SERVER_BASE_URL || 'https://app.yoursite.com';
     const redirectUrl = `${FRONTEND_BASE.replace(/\/$/, '')}/api/subscription/redirect?invoice_no=${encodeURIComponent(invoiceNo)}`;
 
@@ -552,37 +533,24 @@ router.post('/register', async (req, res) => {
     }
 
     // store gateway_response and provider orderId
-    await pool.query(
-      'UPDATE invoices SET gateway_provider = ?, gateway_response = ?, paid_at = NULL WHERE id = ?',
-      ['charge_wamosync', JSON.stringify(body), invRes.insertId]
-    );
+    await pool.query('UPDATE invoices SET gateway_provider = ?, gateway_response = ?, paid_at = NULL WHERE id = ?', [
+      'charge_wamosync',
+      JSON.stringify(body),
+      invRes.insertId
+    ]);
 
-    // notify admin
-    const message = pendingUserId && existingPending.length > 0 
-      ? `🔄 Payment re-initiated for pending user: ${email}\nWebsite: ${websiteUrl}\nInvoice: ${invoiceNo}`
-      : `🆕 New pending registration: ${email}\nWebsite: ${websiteUrl}\nInvoice: ${invoiceNo}`;
-    
-    await sendNotification(message, true);
+    // notify admin and return payment_url to client
+    await sendNotification(`🆕 New pending registration: ${email}\nWebsite: ${websiteUrl}\nInvoice: ${invoiceNo}`, true);
 
     return res.status(201).json({
-      message: pendingUserId && existingPending.length > 0 
-        ? 'Payment process re-initiated. Complete payment to activate your account.'
-        : 'Registration created. Complete payment to activate your account.',
+      message: 'Registration created. Complete payment to activate your account.',
       invoice_no: invoiceNo,
       invoiceId: invRes.insertId,
-      payment_url: body.result.payment_url,
-      is_existing_pending: !!existingPending.length
+      payment_url: body.result.payment_url
     });
   } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'A user with this email already exists.' });
     console.error('Registration error:', error);
-    
-    if (error.code === 'ER_DUP_ENTRY') {
-      if (error.sqlMessage && error.sqlMessage.includes('email')) {
-        return res.status(409).json({ error: 'A user with this email already exists.' });
-      }
-      return res.status(409).json({ error: 'Duplicate entry found.' });
-    }
-    
     res.status(500).json({ error: 'Internal server error during registration.' });
   }
 });
@@ -593,7 +561,6 @@ router.post('/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    // First check users table (completed registration)
     const [users] = await pool.query(
       `SELECT u.id, u.email, u.password_hash, u.license_status, u.license_key, w.url AS websiteUrl, u.phone
        FROM users u
@@ -602,183 +569,80 @@ router.post('/login', async (req, res) => {
       [email]
     );
 
-    // If user exists in users table, handle login flow
-    if (users.length > 0) {
-      const user = users[0];
-
-      if (!user.websiteUrl) {
-        return res.status(500).json({
-          error: 'User is not associated with a website.',
-          subscriptionNeeded: false,
-          licenseKey: user.license_key || null
-        });
-      }
-
-      // 1) verify credentials with customer website
-      try {
-        await axios.post(`${user.websiteUrl}/api/verify-credentials`, { email, password }, { timeout: 10000 });
-      } catch {
-        return res.status(401).json({
-          error: 'Invalid credentials provided for the website.',
-          subscriptionNeeded: false,
-          licenseKey: user.license_key || null
-        });
-      }
-
-      // 2) sync local password hash if needed
-      const isLocalPasswordValid = await bcrypt.compare(password, user.password_hash);
-      if (!isLocalPasswordValid) {
-        const newPasswordHash = await bcrypt.hash(password, 12);
-        await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [newPasswordHash, user.id]);
-      }
-
-      // 3) check license/subscription status using licenseService (will use internal mode if enabled)
-      let currentLicenseStatus = user.license_status;
-      if (user.license_key) {
-        try {
-          const hostname = (() => {
-            try {
-              if (user.websiteUrl.includes('://')) return new URL(user.websiteUrl).hostname;
-              return user.websiteUrl;
-            } catch {
-              return user.websiteUrl;
-            }
-          })();
-
-          const result = await licenseService.checkUserLicense(user.license_key, { domain: hostname, userId: user.id });
-          const newStatus = result.status || 'invalid';
-
-          if (newStatus !== currentLicenseStatus) {
-            await pool.query(
-              'UPDATE users SET license_status = ?, updated_at = NOW() WHERE id = ?',
-              [newStatus, user.id]
-            );
-            currentLicenseStatus = newStatus;
-          }
-        } catch (licErr) {
-          console.error('License re-check error:', licErr?.message || licErr);
-          // keep existing status
-        }
-      }
-
-      // 4) If not active, create renewal invoice and return payment_url so client can pay immediately
-      if (currentLicenseStatus !== 'active') {
-        try {
-          // Delete any existing pending invoices for this user
-          await pool.query('DELETE FROM invoices WHERE user_id = ? AND status = "pending"', [user.id]);
-
-          const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
-          const amount = parseFloat(process.env.RENEWAL_AMOUNT || process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00');
-
-          const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
-            invoiceNo, user.id, amount, 'renewal', 'pending'
-          ]);
-
-          const FRONTEND_BASE = process.env.SERVER_BASE_URL || 'https://app.yoursite.com';
-          const redirectUrl = `${FRONTEND_BASE.replace(/\/$/, '')}/api/subscription/redirect?invoice_no=${encodeURIComponent(invoiceNo)}`;
-
-          const { createOrder } = require('../services/chargeGateway');
-          const createResp = await createOrder({
-            amount,
-            customer_mobile: user.phone || '',
-            order_id: invoiceNo,
-            remark1: 'renewal',
-            remark2: `user:${user.id}`,
-            redirect_url: redirectUrl
-          });
-
-          if (!createResp.ok) {
-            console.error('createOrder failed for renewal', createResp);
-            return res.status(502).json({ error: 'payment_provider_error', details: createResp.error });
-          }
-
-          const body = createResp.data;
-          if (!(body && body.status === true && body.result && body.result.payment_url)) {
-            console.error('createOrder returned unexpected for renewal', body);
-            return res.status(502).json({ error: 'payment_create_failed', message: body && body.message });
-          }
-
-          // persist gateway response
-          await pool.query('UPDATE invoices SET gateway_provider = ?, gateway_response = ? WHERE id = ?', [
-            'charge_wamosync',
-            JSON.stringify(body),
-            invRes.insertId
-          ]);
-
-          // return response indicating payment required + payment url
-          return res.status(403).json({
-            error: 'Subscription required',
-            message: 'Your subscription is not active. Please complete payment to renew.',
-            subscriptionNeeded: true,
-            licenseStatus: currentLicenseStatus,
-            invoice_no: invoiceNo,
-            invoiceId: invRes.insertId,
-            payment_url: body.result.payment_url,
-            userType: 'existing' // Indicates this is an existing user needing renewal
-          });
-        } catch (invoiceErr) {
-          console.error('Failed to create renewal invoice', invoiceErr);
-          return res.status(500).json({ error: 'Failed to create renewal invoice', subscriptionNeeded: true });
-        }
-      }
-
-      // 5) everything good -> issue JWT and include license info
-      const token = jwt.sign(
-        { id: user.id, email: user.email },
-        process.env.JWT_SECRET,
-        { expiresIn: '24h' }
-      );
-
-      return res.json({
-        message: 'Login successful',
-        token,
-        licenseKey: user.license_key || null,
-        licenseStatus: currentLicenseStatus,
-        subscriptionNeeded: false
+    if (users.length === 0) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        subscriptionNeeded: false,
+        licenseKey: null
       });
     }
 
-    // If user not found in users table, check pending_users table
-    const [pendingUsers] = await pool.query(
-      `SELECT p.id, p.email, p.password_hash, p.phone, p.meta, w.url AS websiteUrl
-       FROM pending_users p
-       LEFT JOIN websites w ON JSON_EXTRACT(p.meta, '$.website_id') = w.id
-       WHERE p.email = ?`,
-      [email]
-    );
+    const user = users[0];
 
-    if (pendingUsers.length > 0) {
-      const pendingUser = pendingUsers[0];
-      
-      if (!pendingUser.websiteUrl) {
-        return res.status(500).json({
-          error: 'Pending user is not associated with a website.',
-          subscriptionNeeded: true
-        });
-      }
+    if (!user.websiteUrl) {
+      return res.status(500).json({
+        error: 'User is not associated with a website.',
+        subscriptionNeeded: false,
+        licenseKey: user.license_key || null
+      });
+    }
 
-      // Verify credentials with customer website
+    // 1) verify credentials with customer website
+    try {
+      await axios.post(`${user.websiteUrl}/api/verify-credentials`, { email, password }, { timeout: 10000 });
+    } catch {
+      return res.status(401).json({
+        error: 'Invalid credentials provided for the website.',
+        subscriptionNeeded: false,
+        licenseKey: user.license_key || null
+      });
+    }
+
+    // 2) sync local password hash if needed
+    const isLocalPasswordValid = await bcrypt.compare(password, user.password_hash);
+    if (!isLocalPasswordValid) {
+      const newPasswordHash = await bcrypt.hash(password, 12);
+      await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [newPasswordHash, user.id]);
+    }
+
+    // 3) check license/subscription status using licenseService (will use internal mode if enabled)
+    let currentLicenseStatus = user.license_status;
+    if (user.license_key) {
       try {
-        await axios.post(`${pendingUser.websiteUrl}/api/verify-credentials`, { email, password }, { timeout: 10000 });
-      } catch {
-        return res.status(401).json({
-          error: 'Invalid credentials provided for the website.',
-          subscriptionNeeded: true
-        });
+        const hostname = (() => {
+          try {
+            if (user.websiteUrl.includes('://')) return new URL(user.websiteUrl).hostname;
+            return user.websiteUrl;
+          } catch {
+            return user.websiteUrl;
+          }
+        })();
+
+        const result = await licenseService.checkUserLicense(user.license_key, { domain: hostname, userId: user.id });
+        const newStatus = result.status || 'invalid';
+
+        if (newStatus !== currentLicenseStatus) {
+          await pool.query(
+            'UPDATE users SET license_status = ?, updated_at = NOW() WHERE id = ?',
+            [newStatus, user.id]
+          );
+          currentLicenseStatus = newStatus;
+        }
+      } catch (licErr) {
+        console.error('License re-check error:', licErr?.message || licErr);
+        // keep existing status
       }
+    }
 
-      // ALWAYS CREATE NEW ORDER - Delete any existing pending invoices
-      await pool.query('DELETE FROM invoices WHERE pending_user_id = ? AND status = "pending"', [pendingUser.id]);
-
+    // 4) If not active, create renewal invoice and return payment_url so client can pay immediately
+    if (currentLicenseStatus !== 'active') {
       try {
         const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
-        const amount = parseFloat(process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00');
+        const amount = parseFloat(process.env.RENEWAL_AMOUNT || process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00');
 
-        const [invRes] = await pool.query(
-          'INSERT INTO invoices (invoice_no, pending_user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())',
-          [invoiceNo, pendingUser.id, amount, 'initial', 'pending']
-        );
-        const invoiceId = invRes.insertId;
+        const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
+          invoiceNo, user.id, amount, 'renewal', 'pending'
+        ]);
 
         const FRONTEND_BASE = process.env.SERVER_BASE_URL || 'https://app.yoursite.com';
         const redirectUrl = `${FRONTEND_BASE.replace(/\/$/, '')}/api/subscription/redirect?invoice_no=${encodeURIComponent(invoiceNo)}`;
@@ -786,61 +650,60 @@ router.post('/login', async (req, res) => {
         const { createOrder } = require('../services/chargeGateway');
         const createResp = await createOrder({
           amount,
-          customer_mobile: pendingUser.phone || '',
+          customer_mobile: user.phone || '',
           order_id: invoiceNo,
-          remark1: 'initial_subscription',
-          remark2: `pending_user:${pendingUser.id}`,
+          remark1: 'renewal',
+          remark2: `user:${user.id}`,
           redirect_url: redirectUrl
         });
 
         if (!createResp.ok) {
-          console.error('createOrder failed for pending user', createResp);
+          console.error('createOrder failed for renewal', createResp);
           return res.status(502).json({ error: 'payment_provider_error', details: createResp.error });
         }
 
         const body = createResp.data;
         if (!(body && body.status === true && body.result && body.result.payment_url)) {
-          console.error('createOrder returned unexpected for pending user', body);
+          console.error('createOrder returned unexpected for renewal', body);
           return res.status(502).json({ error: 'payment_create_failed', message: body && body.message });
         }
 
-        // Update invoice with gateway response
-        await pool.query(
-          'UPDATE invoices SET gateway_provider = ?, gateway_response = ? WHERE id = ?',
-          ['charge_wamosync', JSON.stringify(body), invoiceId]
-        );
+        // persist gateway response
+        await pool.query('UPDATE invoices SET gateway_provider = ?, gateway_response = ? WHERE id = ?', [
+          'charge_wamosync',
+          JSON.stringify(body),
+          invRes.insertId
+        ]);
 
-        // Sync local password hash if needed
-        const isLocalPasswordValid = await bcrypt.compare(password, pendingUser.password_hash);
-        if (!isLocalPasswordValid) {
-          const newPasswordHash = await bcrypt.hash(password, 12);
-          await pool.query('UPDATE pending_users SET password_hash = ? WHERE id = ?', [newPasswordHash, pendingUser.id]);
-        }
-
-        return res.status(402).json({
-          error: 'Payment required',
-          message: 'Please complete your initial payment to activate your account.',
+        // return response indicating payment required + payment url
+        return res.status(403).json({
+          error: 'Subscription required',
+          message: 'Your subscription is not active. Please complete payment to renew.',
           subscriptionNeeded: true,
+          licenseStatus: currentLicenseStatus,
           invoice_no: invoiceNo,
-          invoiceId: invoiceId,
-          payment_url: body.result.payment_url,
-          userType: 'pending' // Indicates this is a pending user needing initial payment
+          invoiceId: invRes.insertId,
+          payment_url: body.result.payment_url
         });
-
       } catch (invoiceErr) {
-        console.error('Failed to create invoice for pending user', invoiceErr);
-        return res.status(500).json({ 
-          error: 'Failed to create payment invoice', 
-          subscriptionNeeded: true 
-        });
+        console.error('Failed to create renewal invoice', invoiceErr);
+        return res.status(500).json({ error: 'Failed to create renewal invoice', subscriptionNeeded: true });
       }
     }
 
-    // If user not found in either table
-    return res.status(401).json({
-      error: 'Invalid credentials',
-      subscriptionNeeded: false,
-      licenseKey: null
+    // 5) everything good -> issue JWT and include license info
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    return res.json({
+      message: 'Login successful',
+      token,
+      licenseKey: user.license_key || null,
+      licenseStatus: currentLicenseStatus,
+      subscriptionNeeded: false
     });
 
   } catch (error) {
@@ -851,6 +714,7 @@ router.post('/login', async (req, res) => {
     });
   }
 });
+
 
 
 // Secure App Upload Endpoint (Postman/API method)
