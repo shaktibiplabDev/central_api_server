@@ -442,7 +442,13 @@ function authenticateToken(req, res, next) {
 // POST /register
 router.post('/register', async (req, res) => {
   try {
-    const { email, password, websiteUrl, phone } = req.body;
+    let { email, password, websiteUrl, phone } = req.body;
+
+    // ✅ Normalize websiteUrl: remove single or multiple trailing slashes
+    if (websiteUrl) {
+      websiteUrl = websiteUrl.replace(/\/+$/, '');
+    }
+
     if (!email || !password || !websiteUrl) {
       return res.status(400).json({ error: 'All fields are required.' });
     }
@@ -491,9 +497,15 @@ router.post('/register', async (req, res) => {
     let websiteId;
     if (websites.length > 0) {
       websiteId = websites[0].id;
-      await pool.query("UPDATE websites SET status = ?, website_license_key = ?, client_name = ? WHERE id = ?", [finalWebsiteStatus, websiteLicenseKey, clientName, websiteId]);
+      await pool.query(
+        "UPDATE websites SET status = ?, website_license_key = ?, client_name = ? WHERE id = ?",
+        [finalWebsiteStatus, websiteLicenseKey, clientName, websiteId]
+      );
     } else {
-      const [newWebsite] = await pool.query("INSERT INTO websites (url, status, website_license_key, client_name, created_at) VALUES (?, ?, ?, ?, NOW())", [websiteUrl, finalWebsiteStatus, websiteLicenseKey, clientName]);
+      const [newWebsite] = await pool.query(
+        "INSERT INTO websites (url, status, website_license_key, client_name, created_at) VALUES (?, ?, ?, ?, NOW())",
+        [websiteUrl, finalWebsiteStatus, websiteLicenseKey, clientName]
+      );
       websiteId = newWebsite.insertId;
     }
 
@@ -586,6 +598,7 @@ router.post('/register', async (req, res) => {
     res.status(500).json({ error: 'Internal server error during registration.' });
   }
 });
+
 
 // POST /login
 router.post('/login', async (req, res) => {
