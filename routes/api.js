@@ -12,7 +12,7 @@ const subscriptionRoutes = require('./subscriptions');
 const { pool } = require('../config/database');
 const { checkUserLicense, checkWebsiteLicense } = require('../services/licenseService');
 const { checkNameservers } = require('../services/dnsService');
-const { sendNotification } = require('../bot/bot');
+const { sendNotification, sendEmbedNotification } = require('../bot/bot');
 const settingsService = require('../services/settingsService');
 
 const router = express.Router();
@@ -569,12 +569,17 @@ router.post('/register', async (req, res) => {
       ['charge_wamosync', JSON.stringify(body), invRes.insertId]
     );
 
-    // notify admin
-    const message = pendingUserId && existingPending.length > 0 
-      ? `🔄 Payment re-initiated for pending user: ${email}\nWebsite: ${websiteUrl}\nInvoice: ${invoiceNo}`
-      : `🆕 New pending registration: ${email}\nWebsite: ${websiteUrl}\nInvoice: ${invoiceNo}`;
-    
-    await sendNotification(message, true);
+    // notify admin via Discord
+    await sendEmbedNotification(
+      '🆕 New Registration',
+      `**Email:** ${email}\n**Website:** ${websiteUrl}\n**Invoice:** ${invoiceNo}`,
+      [
+        { name: 'Status', value: 'Pending Payment', inline: true },
+        { name: 'Type', value: existingPending.length > 0 ? 'Retry' : 'New', inline: true },
+        { name: 'Amount', value: `₹${amount}`, inline: true }
+      ],
+      0x0099FF
+    );
 
     return res.status(201).json({
       message: pendingUserId && existingPending.length > 0 
@@ -588,6 +593,9 @@ router.post('/register', async (req, res) => {
   } catch (error) {
     console.error('Registration error:', error);
     
+    // Send error notification
+    await sendNotification(`❌ Registration failed: ${error.message}`, false, 'error');
+    
     if (error.code === 'ER_DUP_ENTRY') {
       if (error.sqlMessage && error.sqlMessage.includes('email')) {
         return res.status(409).json({ error: 'A user with this email already exists.' });
@@ -599,16 +607,16 @@ router.post('/register', async (req, res) => {
   }
 });
 
-
 // POST /login
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    // First check users table (completed registration)
+    // First check users table (completed registration) - UPDATED QUERY
     const [users] = await pool.query(
-      `SELECT u.id, u.email, u.password_hash, u.license_status, u.license_key, w.url AS websiteUrl, u.phone
+      `SELECT u.id, u.email, u.password_hash, u.license_status, u.license_key, 
+              u.subscription_until, u.phone, w.url AS websiteUrl
        FROM users u
        LEFT JOIN websites w ON u.website_id = w.id
        WHERE u.email = ?`,
@@ -645,93 +653,109 @@ router.post('/login', async (req, res) => {
         await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [newPasswordHash, user.id]);
       }
 
-      // 3) check license/subscription status using licenseService (will use internal mode if enabled)
+      // 3) check license/subscription status using licenseService
       let currentLicenseStatus = user.license_status;
-      if (user.license_key) {
-        try {
-          const hostname = (() => {
-            try {
-              if (user.websiteUrl.includes('://')) return new URL(user.websiteUrl).hostname;
-              return user.websiteUrl;
-            } catch {
-              return user.websiteUrl;
-            }
-          })();
+      
+      // DEBUG LOGGING - Add this to trace the issue
+      console.log('License check results:', {
+        userId: user.id,
+        email: user.email,
+        currentLicenseStatus,
+        licenseKey: user.license_key,
+        websiteUrl: user.websiteUrl,
+        subscriptionUntil: user.subscription_until
+      });
 
-          const result = await licenseService.checkUserLicense(user.license_key, { domain: hostname, userId: user.id });
-          const newStatus = result.status || 'invalid';
+      // 4) UPDATED: Only create renewal if subscription has actually expired
+      const subscriptionUntil = user.subscription_until;
+      const now = new Date();
+      
+      // Check if subscription is expired
+      const isSubscriptionExpired = !subscriptionUntil || new Date(subscriptionUntil) <= now;
+      
+      if (currentLicenseStatus !== 'active' || isSubscriptionExpired) {
+        // Only require payment if subscription has actually expired
+        if (isSubscriptionExpired) {
+          try {
+            // Delete any existing pending invoices for this user
+            await pool.query('DELETE FROM invoices WHERE user_id = ? AND status = "pending"', [user.id]);
 
-          if (newStatus !== currentLicenseStatus) {
-            await pool.query(
-              'UPDATE users SET license_status = ?, updated_at = NOW() WHERE id = ?',
-              [newStatus, user.id]
+            const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
+            const amount = parseFloat(process.env.RENEWAL_AMOUNT || process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00');
+
+            const [invRes] = await pool.query(
+              'INSERT INTO invoices (invoice_no, user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', 
+              [invoiceNo, user.id, amount, 'renewal', 'pending']
             );
-            currentLicenseStatus = newStatus;
+
+            const FRONTEND_BASE = process.env.SERVER_BASE_URL || 'https://app.yoursite.com';
+            const redirectUrl = `${FRONTEND_BASE.replace(/\/$/, '')}/api/subscription/redirect?invoice_no=${encodeURIComponent(invoiceNo)}`;
+
+            const { createOrder } = require('../services/chargeGateway');
+            const createResp = await createOrder({
+              amount,
+              customer_mobile: user.phone || '',
+              order_id: invoiceNo,
+              remark1: 'renewal',
+              remark2: `user:${user.id}`,
+              redirect_url: redirectUrl
+            });
+
+            if (!createResp.ok) {
+              console.error('createOrder failed for renewal', createResp);
+              return res.status(502).json({ error: 'payment_provider_error', details: createResp.error });
+            }
+
+            const body = createResp.data;
+            if (!(body && body.status === true && body.result && body.result.payment_url)) {
+              console.error('createOrder returned unexpected for renewal', body);
+              return res.status(502).json({ error: 'payment_create_failed', message: body && body.message });
+            }
+
+            // persist gateway response
+            await pool.query(
+              'UPDATE invoices SET gateway_provider = ?, gateway_response = ? WHERE id = ?', 
+              ['charge_wamosync', JSON.stringify(body), invRes.insertId]
+            );
+
+            // Send renewal notification
+            await sendEmbedNotification(
+              '🔄 Renewal Required',
+              `**User:** ${user.email}\n**Subscription:** Expired\n**Invoice:** ${invoiceNo}`,
+              [
+                { name: 'User ID', value: user.id.toString(), inline: true },
+                { name: 'Amount', value: `₹${amount}`, inline: true },
+                { name: 'Status', value: 'Payment Required', inline: true }
+              ],
+              0xFEE75C
+            );
+
+            // return response indicating payment required + payment url
+            return res.status(403).json({
+              error: 'Subscription expired',
+              message: 'Your subscription has expired. Please complete payment to renew.',
+              subscriptionNeeded: true,
+              licenseStatus: currentLicenseStatus,
+              invoice_no: invoiceNo,
+              invoiceId: invRes.insertId,
+              payment_url: body.result.payment_url,
+              userType: 'existing'
+            });
+          } catch (invoiceErr) {
+            console.error('Failed to create renewal invoice', invoiceErr);
+            return res.status(500).json({ 
+              error: 'Failed to create renewal invoice', 
+              subscriptionNeeded: true 
+            });
           }
-        } catch (licErr) {
-          console.error('License re-check error:', licErr?.message || licErr);
-          // keep existing status
-        }
-      }
-
-      // 4) If not active, create renewal invoice and return payment_url so client can pay immediately
-      if (currentLicenseStatus !== 'active') {
-        try {
-          // Delete any existing pending invoices for this user
-          await pool.query('DELETE FROM invoices WHERE user_id = ? AND status = "pending"', [user.id]);
-
-          const invoiceNo = 'INV' + Date.now() + Math.floor(Math.random() * 900 + 100);
-          const amount = parseFloat(process.env.RENEWAL_AMOUNT || process.env.INITIAL_SUBSCRIPTION_AMOUNT || '600.00');
-
-          const [invRes] = await pool.query('INSERT INTO invoices (invoice_no, user_id, amount, purpose, status, created_at) VALUES (?, ?, ?, ?, ?, NOW())', [
-            invoiceNo, user.id, amount, 'renewal', 'pending'
-          ]);
-
-          const FRONTEND_BASE = process.env.SERVER_BASE_URL || 'https://app.yoursite.com';
-          const redirectUrl = `${FRONTEND_BASE.replace(/\/$/, '')}/api/subscription/redirect?invoice_no=${encodeURIComponent(invoiceNo)}`;
-
-          const { createOrder } = require('../services/chargeGateway');
-          const createResp = await createOrder({
-            amount,
-            customer_mobile: user.phone || '',
-            order_id: invoiceNo,
-            remark1: 'renewal',
-            remark2: `user:${user.id}`,
-            redirect_url: redirectUrl
-          });
-
-          if (!createResp.ok) {
-            console.error('createOrder failed for renewal', createResp);
-            return res.status(502).json({ error: 'payment_provider_error', details: createResp.error });
-          }
-
-          const body = createResp.data;
-          if (!(body && body.status === true && body.result && body.result.payment_url)) {
-            console.error('createOrder returned unexpected for renewal', body);
-            return res.status(502).json({ error: 'payment_create_failed', message: body && body.message });
-          }
-
-          // persist gateway response
-          await pool.query('UPDATE invoices SET gateway_provider = ?, gateway_response = ? WHERE id = ?', [
-            'charge_wamosync',
-            JSON.stringify(body),
-            invRes.insertId
-          ]);
-
-          // return response indicating payment required + payment url
-          return res.status(403).json({
-            error: 'Subscription required',
-            message: 'Your subscription is not active. Please complete payment to renew.',
-            subscriptionNeeded: true,
-            licenseStatus: currentLicenseStatus,
-            invoice_no: invoiceNo,
-            invoiceId: invRes.insertId,
-            payment_url: body.result.payment_url,
-            userType: 'existing' // Indicates this is an existing user needing renewal
-          });
-        } catch (invoiceErr) {
-          console.error('Failed to create renewal invoice', invoiceErr);
-          return res.status(500).json({ error: 'Failed to create renewal invoice', subscriptionNeeded: true });
+        } else {
+          // Subscription is still valid but status is wrong - fix the status
+          console.log(`Fixing license status for user ${user.id}: subscription valid until ${subscriptionUntil}, but status was ${currentLicenseStatus}`);
+          await pool.query(
+            'UPDATE users SET license_status = ? WHERE id = ?',
+            ['active', user.id]
+          );
+          currentLicenseStatus = 'active';
         }
       }
 
@@ -747,7 +771,8 @@ router.post('/login', async (req, res) => {
         token,
         licenseKey: user.license_key || null,
         licenseStatus: currentLicenseStatus,
-        subscriptionNeeded: false
+        subscriptionNeeded: false,
+        subscriptionUntil: user.subscription_until
       });
     }
 
@@ -830,6 +855,18 @@ router.post('/login', async (req, res) => {
           await pool.query('UPDATE pending_users SET password_hash = ? WHERE id = ?', [newPasswordHash, pendingUser.id]);
         }
 
+        // Send pending user notification
+        await sendEmbedNotification(
+          '⏳ Pending User Login',
+          `**User:** ${pendingUser.email}\n**Status:** Payment Required\n**Invoice:** ${invoiceNo}`,
+          [
+            { name: 'Pending User ID', value: pendingUser.id.toString(), inline: true },
+            { name: 'Amount', value: `₹${amount}`, inline: true },
+            { name: 'Action', value: 'Complete Payment', inline: true }
+          ],
+          0xFEE75C
+        );
+
         return res.status(402).json({
           error: 'Payment required',
           message: 'Please complete your initial payment to activate your account.',
@@ -837,7 +874,7 @@ router.post('/login', async (req, res) => {
           invoice_no: invoiceNo,
           invoiceId: invoiceId,
           payment_url: body.result.payment_url,
-          userType: 'pending' // Indicates this is a pending user needing initial payment
+          userType: 'pending'
         });
 
       } catch (invoiceErr) {
@@ -858,6 +895,7 @@ router.post('/login', async (req, res) => {
 
   } catch (error) {
     console.error('Login error:', error);
+    await sendNotification(`❌ Login error: ${error.message}`, false, 'error');
     return res.status(500).json({
       error: 'Internal server error',
       subscriptionNeeded: true
@@ -915,10 +953,56 @@ router.post('/app-upload', upload.single('apkfile'), async (req, res) => {
 // --- Protected Routes ---
 router.get('/profile', authenticateToken, async (req, res) => {
     try {
-        const [users] = await pool.query("SELECT id, email, license_key, license_status, created_at FROM users WHERE id = ?", [req.user.id]);
+        const [users] = await pool.query(
+            `SELECT id, email, license_key, license_status, subscription_until, created_at 
+             FROM users WHERE id = ?`, 
+            [req.user.id]
+        );
+        
         if (users.length === 0) return res.status(404).json({ error: 'User not found' });
-        const [websites] = await pool.query("SELECT id, url, status, created_at FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", [req.user.id]);
-        res.json({ user: users[0], website: websites[0] || null });
+        
+        const user = users[0];
+        
+        // Calculate days left
+        let daysLeft = 0;
+        let isActive = false;
+        
+        if (user.subscription_until) {
+            const now = new Date();
+            const subscriptionUntil = new Date(user.subscription_until);
+            const timeDiff = subscriptionUntil.getTime() - now.getTime();
+            daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
+            isActive = daysLeft > 0 && user.license_status === 'active';
+            
+            // If subscription is expired but status is still active, update it
+            if (daysLeft <= 0 && user.license_status === 'active') {
+                await pool.query(
+                    'UPDATE users SET license_status = ? WHERE id = ?',
+                    ['expired', user.id]
+                );
+                user.license_status = 'expired';
+            }
+        }
+        
+        const [websites] = await pool.query(
+            "SELECT id, url, status, created_at FROM websites WHERE id = (SELECT website_id FROM users WHERE id = ?)", 
+            [req.user.id]
+        );
+        
+        res.json({ 
+            user: {
+                id: user.id,
+                email: user.email,
+                license_key: user.license_key,
+                license_status: user.license_status,
+                subscription_until: user.subscription_until,
+                days_left: Math.max(0, daysLeft),
+                is_active: isActive,
+                created_at: user.created_at
+            }, 
+            website: websites[0] || null 
+        });
+        
     } catch (error) {
         console.error('Profile fetch error:', error);
         res.status(500).json({ error: 'Internal server error' });

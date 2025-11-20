@@ -1,10 +1,10 @@
-// routes/subscriptions.js
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const bcrypt = require('bcryptjs');
 const { createOrder, checkOrderStatus } = require('../services/chargeGateway');
 const { createUserFromPendingAndActivate, addDaysForUser, daysLeftForUser } = require('../services/internalLicense');
+const { sendNotification, sendEmbedNotification } = require('../bot/bot');
 
 /**
  * Backend base URL used for gateway redirect callback.
@@ -156,9 +156,8 @@ router.get('/pay/:invoiceId', async (req, res) => {
 
 /**
  * GET /api/subscription/redirect
- * Called by gateway via browser redirect. Returns JSON with payment verification result.
+ * Enhanced payment success handler with proper user activation
  */
-// Replace your existing router.get('/redirect', ...) with this handler
 router.get('/redirect', async (req, res) => {
   try {
     const invoiceNo = req.query.invoice_no || req.query.invoiceNo || null;
@@ -212,9 +211,6 @@ router.get('/redirect', async (req, res) => {
     const result = body.result;
     const txnStatus = (result.txnStatus || '').toUpperCase();
 
-    // COMMON: pretty provider JSON for display
-    const providerPretty = safeJsonStringify(body);
-
     if (txnStatus === 'COMPLETED') {
       // idempotent: if already paid, return success page
       const [cur] = await pool.query('SELECT status FROM invoices WHERE id = ?', [invoice.id]);
@@ -229,7 +225,16 @@ router.get('/redirect', async (req, res) => {
         }));
       }
 
-      // record payment (avoid duplicate payments)
+      // ENHANCED PAYMENT SUCCESS HANDLER START
+      console.log('🔄 Processing successful payment for invoice:', invoice.invoice_no);
+
+      // Mark invoice as paid
+      await pool.query(
+        'UPDATE invoices SET status = "paid", paid_at = NOW(), gateway_response = ? WHERE id = ?',
+        [JSON.stringify(body), invoice.id]
+      );
+
+      // Record payment transaction
       const providerTxnId = result.utr || null;
       if (providerTxnId) {
         const [exist] = await pool.query('SELECT id FROM payments WHERE invoice_id = ? AND provider_transaction_id = ?', [invoice.id, providerTxnId]);
@@ -246,41 +251,60 @@ router.get('/redirect', async (req, res) => {
         );
       }
 
-      await pool.query('UPDATE invoices SET status = ?, paid_at = NOW(), gateway_response = ? WHERE id = ?', ['paid', JSON.stringify(body), invoice.id]);
+      let activationResult = null;
 
-      // Activate or create user
+      // For pending users (new registration)
       if (invoice.pending_user_id) {
-        const [p] = await pool.query('SELECT * FROM pending_users WHERE id = ?', [invoice.pending_user_id]);
-        if (p.length) {
+        const [pendingUsers] = await pool.query('SELECT * FROM pending_users WHERE id = ?', [invoice.pending_user_id]);
+        if (pendingUsers.length > 0) {
+          const pendingUser = pendingUsers[0];
+          
           try {
-            const pendingUser = p[0];
-            const meta = JSON.parse(pendingUser.meta || '{}');
-            const websiteId = meta.website_id;
+            // Use internal license service to activate user
+            activationResult = await createUserFromPendingAndActivate(pendingUser, 30);
+            
+            console.log('✅ User activated from pending:', {
+              email: pendingUser.email,
+              userId: activationResult.userId,
+              licenseKey: activationResult.licenseKey,
+              subscriptionUntil: activationResult.subscription_until
+            });
 
-            if (!websiteId) {
-              console.error('No website_id found in pending user meta:', meta);
-              return res.send(renderRedirectPage({
-                status: 'success',
-                title: 'Payment successful — user creation missing data',
-                message: 'Payment recorded but pending user meta missing website_id. Admin reconciliation required.',
-                invoice_no: invoice.invoice_no,
-                provider_response: body
-              }));
-            }
+            // Send activation notification
+            await sendEmbedNotification(
+              '✅ New User Activated',
+              `**Email:** ${pendingUser.email}\n**License:** ${activationResult.licenseKey}\n**Expires:** ${activationResult.subscription_until}`,
+              [
+                { name: 'Invoice', value: invoice.invoice_no, inline: true },
+                { name: 'User ID', value: activationResult.userId.toString(), inline: true },
+                { name: 'Type', value: 'New Registration', inline: true }
+              ],
+              0x57F287 // Green color for success
+            );
 
-            const created = await createUserFromPendingAndActivate(pendingUser, 30, websiteId);
             return res.send(renderRedirectPage({
               status: 'success',
               title: 'User created and activated',
-              message: `User created and subscription activated until ${created.subscription_until}.`,
+              message: `User created and subscription activated until ${activationResult.subscription_until}.`,
               invoice_no: invoice.invoice_no,
-              userId: created.userId,
-              subscription_until: created.subscription_until,
-              website_id: websiteId,
+              userId: activationResult.userId,
+              subscription_until: activationResult.subscription_until,
               provider_response: body
             }));
+
           } catch (err) {
-            console.error('createUserFromPendingAndActivate failed', err);
+            console.error('❌ createUserFromPendingAndActivate failed', err);
+            
+            await sendEmbedNotification(
+              '❌ User Activation Failed',
+              `**Email:** ${pendingUser.email}\n**Invoice:** ${invoice.invoice_no}\n**Error:** ${err.message}`,
+              [
+                { name: 'Pending User ID', value: pendingUser.id.toString(), inline: true },
+                { name: 'Status', value: 'Manual Action Required', inline: true }
+              ],
+              0xED4245 // Red color for error
+            );
+
             return res.send(renderRedirectPage({
               status: 'success',
               title: 'Payment recorded — user creation failed',
@@ -290,6 +314,7 @@ router.get('/redirect', async (req, res) => {
             }));
           }
         } else {
+          await sendNotification(`❌ Payment recorded but pending user missing for invoice: ${invoice.invoice_no}`, false, 'error');
           return res.send(renderRedirectPage({
             status: 'success',
             title: 'Payment recorded — pending user missing',
@@ -298,19 +323,51 @@ router.get('/redirect', async (req, res) => {
             provider_response: body
           }));
         }
-      } else if (invoice.user_id) {
+      } 
+      // For existing users (renewal)
+      else if (invoice.user_id) {
         try {
-          const resultAdd = await addDaysForUser(invoice.user_id, 30);
+          activationResult = await addDaysForUser(invoice.user_id, 30);
+          
+          console.log('✅ Subscription renewed for user:', {
+            userId: invoice.user_id,
+            licenseKey: activationResult.licenseKey,
+            subscriptionUntil: activationResult.subscription_until
+          });
+
+          // Send renewal notification
+          await sendEmbedNotification(
+            '🔄 Subscription Renewed',
+            `**User ID:** ${invoice.user_id}\n**Extended Until:** ${activationResult.subscription_until}`,
+            [
+              { name: 'Invoice', value: invoice.invoice_no, inline: true },
+              { name: 'License Key', value: activationResult.licenseKey, inline: true },
+              { name: 'Type', value: 'Renewal', inline: true }
+            ],
+            0xFEE75C // Yellow color for renewal
+          );
+
           return res.send(renderRedirectPage({
             status: 'success',
             title: 'Subscription extended',
-            message: `Subscription extended until ${resultAdd.subscription_until}`,
+            message: `Subscription extended until ${activationResult.subscription_until}`,
             invoice_no: invoice.invoice_no,
-            subscription_until: resultAdd.subscription_until,
+            subscription_until: activationResult.subscription_until,
             provider_response: body
           }));
+
         } catch (err) {
-          console.error('addDaysForUser failed', err);
+          console.error('❌ addDaysForUser failed', err);
+          
+          await sendEmbedNotification(
+            '❌ Renewal Activation Failed',
+            `**User ID:** ${invoice.user_id}\n**Invoice:** ${invoice.invoice_no}\n**Error:** ${err.message}`,
+            [
+              { name: 'Status', value: 'Manual Action Required', inline: true }
+            ],
+            0xED4245 // Red color for error
+          );
+
           return res.send(renderRedirectPage({
             status: 'success',
             title: 'Payment processed — activation failed',
@@ -321,7 +378,10 @@ router.get('/redirect', async (req, res) => {
         }
       }
 
-      // Generic success
+      // Generic success (should not normally reach here)
+      console.log('✅ Payment processing completed for invoice:', invoice.invoice_no);
+      await sendNotification(`✅ Payment processed for invoice: ${invoice.invoice_no}`, false, 'success');
+      
       return res.send(renderRedirectPage({
         status: 'success',
         title: 'Payment processed',
@@ -333,6 +393,7 @@ router.get('/redirect', async (req, res) => {
     }
 
     if (txnStatus === 'PENDING') {
+      await sendNotification(`⏳ Payment pending for invoice: ${invoice.invoice_no}`, false, 'warning');
       return res.send(renderRedirectPage({
         status: 'pending',
         title: 'Payment pending',
@@ -344,6 +405,17 @@ router.get('/redirect', async (req, res) => {
 
     // failed or unknown
     await pool.query('UPDATE invoices SET status = ?, gateway_response = ? WHERE id = ?', ['failed', JSON.stringify(body), invoice.id]);
+    
+    await sendEmbedNotification(
+      '❌ Payment Failed',
+      `**Invoice:** ${invoice.invoice_no}\n**Reason:** ${body.message || 'Unknown error'}`,
+      [
+        { name: 'Amount', value: `₹${invoice.amount}`, inline: true },
+        { name: 'Status', value: 'Failed', inline: true }
+      ],
+      0xED4245
+    );
+
     return res.send(renderRedirectPage({
       status: 'failed',
       title: 'Payment failed',
@@ -352,7 +424,10 @@ router.get('/redirect', async (req, res) => {
       provider_response: body
     }));
   } catch (err) {
-    console.error('redirect handler error', err);
+    console.error('💥 redirect handler error', err);
+    
+    await sendNotification(`💥 Critical error in payment redirect: ${err.message}`, false, 'error');
+    
     res.status(500);
     return res.send(renderRedirectPage({
       status: 'error',
@@ -362,6 +437,8 @@ router.get('/redirect', async (req, res) => {
     }));
   }
 });
+
+// ... (keep the existing helper functions: safeJsonStringify, escapeHtml, renderRedirectPage, etc.)
 
 /**
  * Helper: safely stringify JSON for display
@@ -384,7 +461,6 @@ function escapeHtml(str) {
 
 /**
  * Renders a responsive single-page HTML for the redirect result.
- * Accepts an object with: status (success|failed|pending|error), title, message, invoice_no, amount, userId, subscription_until, website_id, provider_response.
  */
 function renderRedirectPage({ status, title, message, invoice_no, amount, userId, subscription_until, website_id, provider_response }) {
   const colorMap = {
